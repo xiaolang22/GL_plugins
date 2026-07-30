@@ -2,7 +2,7 @@ import sys
 import os
 import logging
 import json
-import xml.etree.ElementTree as ET
+import httpx
 from fastapi import FastAPI, Query, Request, Response
 from fastapi.responses import PlainTextResponse
 import uvicorn
@@ -31,10 +31,6 @@ async def verify_url(
     echostr: str = Query(...)
 ):
     logging.info("=== 收到验证请求 ===")
-    logging.info(f"msg_signature: {msg_signature}")
-    logging.info(f"timestamp: {timestamp}")
-    logging.info(f"nonce: {nonce}")
-    
     try:
         ret, sReplyEchoStr = wxcpt.VerifyURL(msg_signature, timestamp, nonce, echostr)
         if ret != 0:
@@ -67,9 +63,8 @@ async def handle_plugin(request: Request):
     
     # 2. 读取请求体（加密的 JSON）
     body_json_str = await request.body()
-    logging.info(f"收到加密请求体: {body_json_str[:200]}...")
     
-    # 3. 解析 JSON，提取 encrypt 字段，并构造 XML 格式（因为当前库只支持 XML）
+    # 3. 解析 JSON，提取 encrypt 字段，构造 XML 格式
     try:
         body_dict = json.loads(body_json_str)
         encrypt = body_dict.get("encrypt", "")
@@ -77,23 +72,49 @@ async def handle_plugin(request: Request):
             logging.error("请求体中缺少 encrypt 字段")
             return Response(content="", status_code=200)
         
-        # 构造企业微信回调 XML 格式
         xml_body = f"<xml><Encrypt><![CDATA[{encrypt}]]></Encrypt></xml>"
         xml_body_bytes = xml_body.encode('utf-8')
-        logging.info(f"构造的 XML: {xml_body[:200]}...")
         
-        # 4. 解密请求（现在传入 XML 格式）
+        # 4. 解密请求
         ret, decrypted_msg = wxcpt.DecryptMsg(xml_body_bytes, msg_signature, timestamp, nonce)
         if ret != 0:
             logging.error(f"解密失败，错误码: {ret}")
             return Response(content="", status_code=200)
         
-        logging.info(f"解密后的明文: {decrypted_msg}")
-        
-        # 5. 解析明文（此时是 JSON 格式的字符串）
+        # 5. 解析明文 JSON
         msg_data = json.loads(decrypted_msg)
         user_content = msg_data.get("text", {}).get("content", "")
+        response_url = msg_data.get("response_url", "")
         logging.info(f"用户说: {user_content}")
+        logging.info(f"response_url: {response_url}")
+        
+        # 6. 【关键】主动回复：通过 response_url 发送消息
+        # 先返回 200，表示已收到请求
+        # 然后异步发送回复（这里为了简单，同步发送，实际可放在后台任务中）
+        if response_url:
+            reply_payload = {
+                "msgtype": "markdown",
+                "markdown": {
+                "content": "Hello, World!"
+            }
+            }
+            
+            async with httpx.AsyncClient() as client:
+                try:
+                    resp = await client.post(
+                        response_url,
+                        json=reply_payload,
+                        headers={"Content-Type": "application/json"}
+                    )
+                    logging.info(f"主动回复状态码: {resp.status_code}")
+                    logging.info(f"主动回复响应: {resp.text}")
+                except Exception as e:
+                    logging.error(f"主动回复失败: {e}")
+        else:
+            logging.warning("没有 response_url，无法主动回复")
+        
+        # 7. 直接返回 200（此时回复已通过 response_url 发送）
+        return Response(content="", status_code=200)
         
     except json.JSONDecodeError as e:
         logging.error(f"JSON 解析失败: {e}")
@@ -101,27 +122,6 @@ async def handle_plugin(request: Request):
     except Exception as e:
         logging.error(f"处理请求异常: {e}")
         return Response(content="", status_code=200)
-    
-    # 6. 构造回复内容
-    reply_text = "Hello, World!"
-    
-    # 7. 构造回复 JSON
-    reply_json = {
-        "msgtype": "text",
-        "text": {"content": reply_text}
-    }
-    
-    # 8. 加密回复
-    reply_str = json.dumps(reply_json, ensure_ascii=False)
-    ret, encrypted_reply = wxcpt.EncryptMsg(reply_str, nonce, timestamp)
-    if ret != 0:
-        logging.error(f"加密回复失败，错误码: {ret}")
-        return Response(content="", status_code=200)
-    
-    logging.info(f"加密后的回复: {encrypted_reply[:200]}...")
-    
-    # 9. 返回加密后的回复
-    return Response(content=encrypted_reply, media_type="application/json")
 
 
 if __name__ == "__main__":
