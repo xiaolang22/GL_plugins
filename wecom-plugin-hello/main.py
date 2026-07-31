@@ -9,7 +9,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 app = FastAPI()
 
-@app.post("/test")
+@app.post("/hello")
 async def handle_plugin(request: Request):
     try:
         # 打印请求体用于调试
