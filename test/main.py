@@ -16,9 +16,9 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 app = FastAPI()
 
-TOKEN = "ndjAHPQANo8wyvX"
-ENCODING_AES_KEY = "UEYyjrrX5eXVTXVQB18Td7hVk2wSSFB0KB6Kf92nYtA"
-CORP_ID = ""
+TOKEN = "fULrhWkcy3WGNu4fM8DJ32af"
+ENCODING_AES_KEY = "Pmx11AhQn3fYQh1zTi7bxS1XCuiLMbA5vC8Fesqi8Bz"
+CORP_ID = "ww742ff47a509b856e"
 
 wxcpt = WXBizMsgCrypt(TOKEN, ENCODING_AES_KEY, CORP_ID)
 
