@@ -9,7 +9,7 @@ import uvicorn
 sys.path.append(os.path.dirname(__file__))
 
 from db import init_db
-from composite import create_smart_sheet_and_sync, create_template_sheet_and_sync
+from composite import create_smart_sheet_and_sync, create_template_sheet_and_sync, SEAT_DATA
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 

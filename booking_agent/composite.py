@@ -94,39 +94,91 @@ def create_template_sheet_and_sync(corp_id: str, secret: str, template_name: str
     sheet_result = api_wework.add_sheet(token, doc_id, template_name)
     sheet_id = sheet_result["properties"]["sheet_id"]
 
-    # 2. 定义字段（按顺序）
+    # 1.5 将子表自带的默认字段重命名为第一个字段"座位名称"
+    # （add_sheet 会自动创建一个默认文本字段，子表至少需保留一个字段，不能直接删除）
+    existing_fields = api_wework.get_fields(token, doc_id, sheet_id)
+    default_fields = existing_fields.get("fields", [])
+    if default_fields:
+        default_field_id = default_fields[0]["field_id"]
+        api_wework.update_fields(token, doc_id, sheet_id, [{
+            "field_id": default_field_id,
+            "field_title": "座位名称",
+            "field_type": "FIELD_TYPE_TEXT"
+        }])
+
+    # 2. 添加剩余 9 个字段（"座位名称"已通过重命名默认字段获得，保持第一列）
+    # 需求从左到右顺序：座位名称(已有)、座位容量、座位备注、客人称呼、客人电话、人数、留菜、留位人、座位类型、是否已订
+    # 注意：add_fields 会将新字段**前置插入**（插入到最左侧），因此需要按逆序传入，才能得到正确从左到右顺序
     fields = [
-        {"field_title": "座位名称", "field_type": "text"},
-        {"field_title": "座位容量", "field_type": "number"},
-        {"field_title": "座位备注", "field_type": "text"},
-        {"field_title": "客人称呼", "field_type": "text"},
-        {"field_title": "客人电话", "field_type": "text"},
-        {"field_title": "人数", "field_type": "text"},  # 实际应为数字，但需求中留空，使用文本
-        {"field_title": "留菜", "field_type": "text"},
-        {"field_title": "留位人", "field_type": "text"},
-        {"field_title": "座位类型", "field_type": "select", "options": {"options": ["房间", "大厅"]}},
-        {"field_title": "是否已订", "field_type": "select", "options": {"options": ["已订座", "未订座"]}},
+        {
+            "field_title": "是否已订",
+            "field_type": "FIELD_TYPE_SINGLE_SELECT",
+            "property_single_select": {
+                "options": [{"text": "已订座"}, {"text": "未订座"}]
+            }
+        },
+        {
+            "field_title": "座位类型",
+            "field_type": "FIELD_TYPE_SINGLE_SELECT",
+            "property_single_select": {
+                "options": [{"text": "房间"}, {"text": "大厅"}]
+            }
+        },
+        {"field_title": "留位人", "field_type": "FIELD_TYPE_TEXT"},
+        {"field_title": "留菜", "field_type": "FIELD_TYPE_TEXT"},
+        {"field_title": "人数", "field_type": "FIELD_TYPE_TEXT"},
+        {"field_title": "客人电话", "field_type": "FIELD_TYPE_TEXT"},
+        {"field_title": "客人称呼", "field_type": "FIELD_TYPE_TEXT"},
+        {"field_title": "座位备注", "field_type": "FIELD_TYPE_TEXT"},
+        {"field_title": "座位容量", "field_type": "FIELD_TYPE_TEXT"},
     ]
     api_wework.add_fields(token, doc_id, sheet_id, fields)
 
     # 3. 添加记录
+    # 文本字段值需为 [{"type": "text", "text": "..."}]，单选字段值需为 [{"text": "..."}]
+    def text_value(s):
+        return [{"type": "text", "text": str(s)}]
+
+    def select_value(s):
+        return [{"text": str(s)}]
+
     records = []
     for name, capacity, remark, seat_type in SEAT_DATA:
         records.append({
             "values": {
-                "座位名称": name,
-                "座位容量": capacity,
-                "座位备注": remark,
-                "座位类型": seat_type,
-                "是否已订": "未订座"
+                "座位名称": text_value(name),
+                "座位容量": text_value(capacity),
+                "座位备注": text_value(remark),
+                "座位类型": select_value(seat_type),
+                "是否已订": select_value("未订座")
             }
         })
     api_wework.add_records(token, doc_id, sheet_id, records)
 
-    # 4. 同步数据库：插入模板记录
+    # 4. 设置分组规则：1.按是否已订选项正序；2.按座位类型选项正序
+    # 需要先获取"座位类型"和"是否已订"字段的 field_id，以及默认视图的 view_id
+    all_fields = api_wework.get_fields(token, doc_id, sheet_id)
+    field_id_map = {f["field_title"]: f["field_id"] for f in all_fields.get("fields", [])}
+    seat_type_field_id = field_id_map.get("座位类型")
+    is_booked_field_id = field_id_map.get("是否已订")
+
+    views_result = api_wework.get_views(token, doc_id, sheet_id)
+    views = views_result.get("views", [])
+    if views and seat_type_field_id and is_booked_field_id:
+        default_view_id = views[0]["view_id"]
+        api_wework.update_view(token, doc_id, sheet_id, default_view_id, {
+            "group_spec": {
+                "groups": [
+                    {"field_id": is_booked_field_id, "desc": False},
+                    {"field_id": seat_type_field_id, "desc": False}
+                ]
+            }
+        })
+
+    # 5. 同步数据库：插入模板记录
     template_db_id = db.insert_template(doc_id, sheet_id, template_name, operator_userid)
 
-    # 5. 日志
+    # 6. 日志
     user_id = db.insert_user(operator_userid, operator_name)
     db.insert_log(
         operator_id=user_id,
