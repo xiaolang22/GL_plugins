@@ -1,8 +1,8 @@
 import logging
 import calendar
 import httpx
-from datetime import date, timedelta
-from typing import List, Dict, Any
+from datetime import date, datetime, timedelta
+from typing import List, Dict, Any, Tuple, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import api_wework
 import db
@@ -571,4 +571,254 @@ def create_bulk_sheets_and_sync(corp_id: str, secret: str, operator_userid: str,
         "phase1_failed": [{"sheet_name": t["sheet_name"], "error": e} for t, e in phase1_failed],
         "phase3_retry_success": [{"sheet_name": t["sheet_name"]} for t, _sid in phase3_success],
         "phase3_retry_failed": [{"sheet_name": t["sheet_name"], "error": e} for t, _sid, e in phase3_failed],
+    }
+
+
+# ============================================================
+# 工具4：按任意日期 + 场次新建工作表（单张入口，外部可访问）
+# ============================================================
+def _parse_date_str(date_str: str) -> date:
+    """解析日期字符串，支持 'YYYY-MM-DD' / 'YYYY/MM/DD' / 'MM-DD' / 'MM/DD'"""
+    if not date_str:
+        raise ValueError("date 参数不能为空")
+    s = date_str.strip().replace("/", "-")
+    parts = s.split("-")
+    if len(parts) == 3:
+        y, m, d = (int(p) for p in parts)
+    elif len(parts) == 2:
+        m, d = (int(p) for p in parts)
+        y = date.today().year
+    else:
+        raise ValueError(f"无法解析日期 '{date_str}'，请使用 YYYY-MM-DD 或 MM-DD 格式")
+    try:
+        return date(y, m, d)
+    except ValueError as e:
+        raise ValueError(f"日期不合法 '{date_str}': {e}")
+
+
+def _make_sheet_name(target: date, session_label: str) -> str:
+    """生成工作表名称：'{月}-{日}{午市/晚市}{星期}'，示例：'9-26晚市周六'"""
+    return f"{target.month}-{target.day}{session_label}{WEEKDAYS[target.weekday()]}"
+
+
+def _normalize_sessions(raw_sessions: Optional[List], default_sessions: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
+    """把 sessions 参数标准化为 [(session_type, label), ...] 列表
+
+    支持输入：
+        None 或 "all" 或 空串 → 默认为 default_sessions
+        ["lunch", "dinner"] → 按 type 从 default_sessions 里匹配
+        [{"session_type": "lunch", "label": "午市"}, ...] → 完整结构
+        单个字符串 "lunch" / "午市" → 先匹配 type，再匹配 label
+    """
+    if raw_sessions is None or raw_sessions == "" or raw_sessions == "all":
+        return list(default_sessions)
+
+    # 允许单个值：字符串 or 单场 dict
+    if isinstance(raw_sessions, str):
+        raw_sessions = [raw_sessions]
+
+    result = []
+    known_types = {t for t, _l in default_sessions}
+    known_labels = {l: t for t, l in default_sessions}
+
+    for item in raw_sessions:
+        if isinstance(item, (list, tuple)) and len(item) >= 2:
+            result.append((str(item[0]), str(item[1])))
+            continue
+        if isinstance(item, dict):
+            stype = item.get("session_type") or item.get("type")
+            slabel = item.get("label") or item.get("name") or item.get("session_label")
+            if stype and slabel:
+                result.append((stype, slabel))
+                continue
+            if stype:
+                # 找默认 label
+                for t, l in default_sessions:
+                    if t == stype:
+                        result.append((t, l))
+                        break
+                continue
+            if slabel:
+                for t, l in default_sessions:
+                    if l == slabel:
+                        result.append((t, l))
+                        break
+                continue
+            raise ValueError(f"sessions 项格式不合法: {item}")
+        if isinstance(item, str):
+            # 先匹配 session_type，再匹配中文 label
+            s = item.strip()
+            if s in known_types:
+                for t, l in default_sessions:
+                    if t == s:
+                        result.append((t, l))
+                        break
+            elif s in known_labels:
+                result.append((known_labels[s], s))
+            else:
+                raise ValueError(f"未知的 sessions 值: '{s}'，有效值为: {[t for t, _l in default_sessions]} 或 {[l for _t, l in default_sessions]}")
+        else:
+            raise ValueError(f"sessions 项格式不合法: {item!r}（类型 {type(item).__name__}）")
+
+    if not result:
+        raise ValueError("sessions 为空，请至少指定一个场次")
+
+    # 去重（保留首次顺序）
+    seen = set()
+    unique = []
+    for t, l in result:
+        if t not in seen:
+            seen.add(t)
+            unique.append((t, l))
+    return unique
+
+
+def create_any_sheet_and_sync(
+    corp_id: str,
+    secret: str,
+    operator_userid: str,
+    operator_name: str,
+    sheet_date: str,
+    sessions: Optional[List] = None,
+    default_sessions: Optional[List[Tuple[str, str]]] = None,
+) -> Dict[str, Any]:
+    """在第一个智能表格中，按任意日期 + 场次新建工作表（默认午市+晚市）
+
+    校验逻辑（按需求）：
+      1. 不允许与现有表命名重复 → 任一 sheet_name 存在时立即报错，不创建任何表
+      2. 不允许新建当前日期之前的工作表 → sheet_date < today 立即报错
+
+    参数:
+        corp_id, secret:  企业微信凭证
+        operator_userid, operator_name: 操作人
+        sheet_date:  目标日期字符串，支持 YYYY-MM-DD / MM-DD
+        sessions:    场次列表，支持多种格式（见 _normalize_sessions），None=default_sessions
+        default_sessions: 场次的默认配置，示例 [("lunch","午市"), ("dinner","晚市")]
+
+    返回: {
+        "created_count": int,
+        "skipped_count": int,
+        "date": "YYYY-MM-DD",
+        "weekday": "周X",
+        "sheets": [{"sheet_name": str, "sheet_id": str, "session_type": str, "status": str}]
+    }
+    """
+    if default_sessions is None:
+        default_sessions = [("lunch", "午市"), ("dinner", "晚市")]
+
+    # ---------- 步骤 0：前置校验 ----------
+    target_date = _parse_date_str(sheet_date)
+    today = date.today()
+
+    # 校验 1：不允许新建当前日期之前的工作表
+    if target_date < today:
+        raise ValueError(
+            f"不允许新建过去日期的工作表：目标 {target_date.isoformat()} < 今日 {today.isoformat()}"
+        )
+
+    # 解析 sessions
+    normalized_sessions = _normalize_sessions(sessions, default_sessions)
+
+    # 预生成所有 sheet_name
+    planned_names = [
+        _make_sheet_name(target_date, label)
+        for _t, label in normalized_sessions
+    ]
+
+    # 校验 2：批量查重（命中任一即报错，确保不局部创建）
+    existing = db.get_existing_sheet_names(planned_names)
+    if existing:
+        raise ValueError(
+            f"不允许重复创建：以下工作表名称已存在 -> "
+            + "、".join(existing)
+        )
+
+    # ---------- 步骤 0.5：获取依赖数据 ----------
+    doc_id = db.get_first_doc()
+    if not doc_id:
+        raise Exception("数据库中还没有智能表格，请先调用 /create_doc 创建")
+    template = db.get_first_template()
+    if not template:
+        raise Exception("数据库中还没有模板工作表，请先调用 /create_template 创建")
+    template_content = template.get("template_content")
+    if not template_content:
+        raise Exception("模板工作表内容为空（template_content 未写入），请重新创建模板")
+    template_id = template["id"]
+
+    user_id = db.insert_user(operator_userid, operator_name)
+
+    # ---------- 步骤 1：串行创建 + 填充（单张量级，无需并发）----------
+    weekday = WEEKDAYS[target_date.weekday()]
+    date_iso = target_date.isoformat()
+    sheet_results = []
+
+    with httpx.Client(timeout=30) as client:
+        token = api_wework.get_access_token(client, corp_id, secret)
+
+        for (session_type, session_label), sheet_name in zip(normalized_sessions, planned_names):
+            # 1a. 创建子表
+            add_result = api_wework.add_sheet(client, token, doc_id, sheet_name)
+            sheet_id = add_result["properties"]["sheet_id"]
+
+            # 1b. 复用填充函数：字段/记录/分组规则
+            _fill_sheet_from_template(client, token, doc_id, sheet_id, template_content)
+
+            # 1c. 同步数据库
+            db.insert_sheet(
+                doc_id=doc_id,
+                sheet_id=sheet_id,
+                sheet_name=sheet_name,
+                sheet_date=date_iso,
+                session_type=session_type,
+                weekday=weekday,
+                template_id=template_id,
+                created_by=operator_userid,
+            )
+
+            sheet_results.append({
+                "sheet_name": sheet_name,
+                "sheet_id": sheet_id,
+                "session_type": session_type,
+                "status": "created",
+            })
+            logging.info(f"新建工作表成功: {sheet_name}")
+
+    # ---------- 步骤 2：操作日志 ----------
+    detail = {
+        "date": date_iso,
+        "weekday": weekday,
+        "created_count": len(sheet_results),
+        "sessions": [
+            {"session_type": s["session_type"], "sheet_name": s["sheet_name"], "sheet_id": s["sheet_id"]}
+            for s in sheet_results
+        ],
+    }
+    target_id_for_log = sheet_results[0]["sheet_name"] if sheet_results else date_iso
+    try:
+        # target_id 是整数：这里优先取首张工作表 DB id 作为代表，否则 0
+        if sheet_results:
+            last = db.get_sheets_by_date(date_iso, doc_id)
+            if last:
+                target_id_for_log = last[-1]["id"]
+            else:
+                target_id_for_log = 0
+        else:
+            target_id_for_log = 0
+    except Exception:
+        target_id_for_log = 0
+
+    db.insert_log(
+        operator_id=user_id,
+        target_id=int(target_id_for_log) if isinstance(target_id_for_log, int) else 0,
+        operation_type="create_sheet",
+        target_type="sheet",
+        detail=detail,
+    )
+
+    return {
+        "date": date_iso,
+        "weekday": weekday,
+        "created_count": len(sheet_results),
+        "skipped_count": 0,
+        "sheets": sheet_results,
     }

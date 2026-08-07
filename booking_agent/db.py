@@ -219,3 +219,48 @@ def get_templates(doc_id=None):
             item["template_content"] = json.loads(item["template_content"])
         results.append(item)
     return results
+
+
+def sheet_name_exists(sheet_name: str) -> bool:
+    """检查指定的工作表名称是否已存在（用于防重复）"""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute('SELECT 1 FROM sheets WHERE sheet_name = ? LIMIT 1', (sheet_name,))
+    exists = cursor.fetchone() is not None
+    conn.close()
+    return exists
+
+
+def get_sheets_by_date(sheet_date: str, doc_id: str = None) -> list:
+    """查询指定日期的工作表列表（用于检查某日期下哪些 session_type 已存在）"""
+    conn = get_connection()
+    cursor = conn.cursor()
+    if doc_id:
+        cursor.execute(
+            'SELECT * FROM sheets WHERE sheet_date = ? AND doc_id = ? ORDER BY id',
+            (sheet_date, doc_id)
+        )
+    else:
+        cursor.execute(
+            'SELECT * FROM sheets WHERE sheet_date = ? ORDER BY id',
+            (sheet_date,)
+        )
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_existing_sheet_names(names: list) -> list:
+    """批量查询已存在的 sheet_name，返回已存在的列表（用于一次查询多个名字）"""
+    if not names:
+        return []
+    conn = get_connection()
+    cursor = conn.cursor()
+    placeholders = ",".join("?" * len(names))
+    cursor.execute(
+        f'SELECT sheet_name FROM sheets WHERE sheet_name IN ({placeholders})',
+        names
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    return [r["sheet_name"] for r in rows]

@@ -9,7 +9,7 @@ import uvicorn
 sys.path.append(os.path.dirname(__file__))
 
 from db import init_db
-from composite import create_smart_sheet_and_sync, create_template_sheet_and_sync, create_bulk_sheets_and_sync, SEAT_DATA
+from composite import create_smart_sheet_and_sync, create_template_sheet_and_sync, create_bulk_sheets_and_sync, create_any_sheet_and_sync, SEAT_DATA
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -124,6 +124,60 @@ async def tool_create_bulk_sheets(request: Request):
         }
     except Exception as e:
         logging.error(f"批量创建工作表失败: {e}")
+        return {"content": f"❌ 操作失败: {str(e)}"}
+
+@app.post("/create_sheet")
+async def tool_create_sheet(request: Request):
+    """工具4：针对第一个智能表格，按任意日期新建工作表（默认午市+晚市，可单独指定）
+
+    校验规则：
+      1. 不允许新建当前日期之前的工作表（如今天 6-2，则 6-1 及之前报错）
+      2. 不允许与现有工作表命名重复（任一命中即报错，不会局部创建）
+
+    请求 Body（JSON）示例：
+      - 创建 2026-09-26 的午市+晚市（默认两张表）：
+        {"date": "2026-09-26", "operator_userid": "xxx", "operator_name": "yyy"}
+      - 创建 9-26 的晚市仅一张（简写 MM-DD，自动用当年）：
+        {"date": "9-26", "sessions": ["dinner"], "operator_userid": "xxx", "operator_name": "yyy"}
+      - sessions 支持 ["lunch", "dinner"] / ["午市", "晚市"] / ["lunch"] / "午市" 等多种写法
+    """
+    try:
+        body = await request.json()
+        sheet_date = body.get("date")
+        if not sheet_date:
+            return {"content": "❌ 参数错误：请提供 date，格式示例 '2026-09-26' 或 '9-26'"}
+        sessions = body.get("sessions", None)  # None → 用默认 SESSIONS（午市+晚市）
+        operator_userid = body.get("operator_userid", "system")
+        operator_name = body.get("operator_name", "系统")
+
+        result = create_any_sheet_and_sync(
+            CORP_ID, SECRET, operator_userid, operator_name,
+            sheet_date=sheet_date,
+            sessions=sessions,
+            default_sessions=SESSIONS,
+        )
+
+        # 构造友好的返回内容
+        created_lines = []
+        for s in result["sheets"]:
+            stype_label = dict(SESSIONS).get(s["session_type"], s["session_type"])
+            created_lines.append(f"  · {s['sheet_name']}（{stype_label}）")
+
+        msg = (
+            f"✅ 成功新建 {result['created_count']} 张工作表\n"
+            f"📅 日期：{result['date']}（{result['weekday']}）\n"
+            + "\n".join(created_lines)
+        )
+
+        return {
+            "content": msg,
+            "date": result["date"],
+            "weekday": result["weekday"],
+            "created_count": result["created_count"],
+            "sheets": result["sheets"],
+        }
+    except Exception as e:
+        logging.error(f"新建工作表失败: {e}")
         return {"content": f"❌ 操作失败: {str(e)}"}
 
 @app.get("/health")
