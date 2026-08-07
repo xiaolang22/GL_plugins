@@ -1,7 +1,12 @@
 import logging
+import calendar
+from datetime import date, timedelta
 from typing import List, Dict, Any
 import api_wework
 import db
+
+# 星期名称（与 date.weekday() 0=周一 对应）
+WEEKDAYS = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
 
 # 座位数据（按顺序）
 SEAT_DATA = [
@@ -234,3 +239,194 @@ def create_template_sheet_and_sync(corp_id: str, secret: str, template_name: str
     )
 
     return {"sheet_id": sheet_id, "template_db_id": template_db_id}
+
+
+def _add_months(d: date, months: int) -> date:
+    """日期加几个月，自动处理月末溢出（如 1月31日 + 1月 = 2月28/29日）"""
+    month = d.month - 1 + months  # 转为 0-indexed 计算
+    year = d.year + month // 12
+    month = month % 12 + 1  # 转回 1-indexed
+    last_day = calendar.monthrange(year, month)[1]
+    day = min(d.day, last_day)
+    return date(year, month, day)
+
+
+def _build_field_payload(field_def: Dict) -> Dict:
+    """把 template_content 中的字段定义转为 add_fields 的 payload 格式"""
+    payload = {"field_title": field_def["field_title"], "field_type": field_def["field_type"]}
+    if field_def["field_type"] == "FIELD_TYPE_SINGLE_SELECT":
+        payload["property_single_select"] = {
+            "options": [{"text": opt} for opt in field_def.get("options", [])]
+        }
+    return payload
+
+
+def _build_record_payload(record: Dict, fields_def: List[Dict]) -> Dict:
+    """把 template_content 中的记录转为 add_records 的 payload 格式"""
+    values = {}
+    for field_def in fields_def:
+        title = field_def["field_title"]
+        value = record.get(title, "")
+        if field_def["field_type"] == "FIELD_TYPE_SINGLE_SELECT":
+            values[title] = [{"text": str(value)}]
+        else:
+            values[title] = [{"type": "text", "text": str(value)}]
+    return {"values": values}
+
+
+def _create_one_sheet_from_template(token: str, doc_id: str, sheet_name: str, template_content: Dict) -> str:
+    """按模板内容创建一张工作表，返回 sheet_id"""
+    fields_def = template_content["fields"]
+
+    # 1. 添加子表
+    sheet_result = api_wework.add_sheet(token, doc_id, sheet_name)
+    sheet_id = sheet_result["properties"]["sheet_id"]
+
+    # 2. 重命名子表自带的默认字段为第一个字段（add_sheet 会自动创建一个默认文本字段）
+    first_field = fields_def[0]
+    existing_fields = api_wework.get_fields(token, doc_id, sheet_id)
+    default_fields = existing_fields.get("fields", [])
+    if default_fields:
+        default_field_id = default_fields[0]["field_id"]
+        api_wework.update_fields(token, doc_id, sheet_id, [{
+            "field_id": default_field_id,
+            "field_title": first_field["field_title"],
+            "field_type": first_field["field_type"]
+        }])
+
+    # 3. 添加剩余字段（逆序传入，因为 add_fields 会将新字段前置插入）
+    rest_fields = [_build_field_payload(f) for f in reversed(fields_def[1:])]
+    if rest_fields:
+        api_wework.add_fields(token, doc_id, sheet_id, rest_fields)
+
+    # 4. 添加记录
+    records = [_build_record_payload(rec, fields_def) for rec in template_content.get("records", [])]
+    if records:
+        api_wework.add_records(token, doc_id, sheet_id, records)
+
+    # 5. 设置分组规则（template_content 中用 field_title 标识，需动态解析为 field_id）
+    group_spec = template_content.get("group_spec", {})
+    groups_def = group_spec.get("groups", [])
+    if groups_def:
+        all_fields = api_wework.get_fields(token, doc_id, sheet_id)
+        field_id_map = {f["field_title"]: f["field_id"] for f in all_fields.get("fields", [])}
+        views_result = api_wework.get_views(token, doc_id, sheet_id)
+        views = views_result.get("views", [])
+        if views:
+            view_id = views[0]["view_id"]
+            groups = []
+            for g in groups_def:
+                fid = field_id_map.get(g["field_title"])
+                if fid:
+                    groups.append({"field_id": fid, "desc": g.get("desc", False)})
+            if groups:
+                api_wework.update_view(token, doc_id, sheet_id, view_id, {
+                    "group_spec": {"groups": groups}
+                })
+
+    return sheet_id
+
+
+def create_bulk_sheets_and_sync(corp_id: str, secret: str, operator_userid: str, operator_name: str,
+                                 months: int = 3, sessions: List[tuple] = None) -> Dict[str, Any]:
+    """
+    复合操作3：批量新建工作表（从今天起未来 months 个月）
+    - 模板内容从数据库读取（templates.template_content）
+    - 一天创建多张工作表（默认午市+晚市）
+    - 命名规则：{月}-{日}{午市/晚市}{星期}，如 "9-26晚市周六"
+    - 同步到 sheets 表
+    返回: {"success_count": ..., "failed_count": ..., ...}
+    """
+    if sessions is None:
+        sessions = [("lunch", "午市"), ("dinner", "晚市")]
+
+    # 1. 获取第一个智能表格
+    doc_id = db.get_first_doc()
+    if not doc_id:
+        raise Exception("没有找到已存在的智能表格，请先创建智能表格")
+
+    # 2. 获取第一个模板（含 template_content）
+    template = db.get_first_template()
+    if not template:
+        raise Exception("没有找到已存在的模板工作表，请先创建模板")
+    template_content = template.get("template_content")
+    template_id = template["id"]
+    if not template_content:
+        raise Exception("模板内容为空，无法复刻工作表")
+
+    token = api_wework.get_access_token(corp_id, secret)
+
+    # 3. 计算日期范围（从今天到三个月后的同一天前一天，与需求示例一致：6月1日 → 8月31日）
+    start_date = date.today()
+    end_date = _add_months(start_date, months) - timedelta(days=1)
+
+    # 4. 遍历每一天，每天按 sessions 创建工作表
+    total_days = (end_date - start_date).days + 1
+    total_sheets = total_days * len(sessions)
+
+    success_count = 0
+    failed_sheets = []
+    created_sheets = []
+
+    user_id = db.insert_user(operator_userid, operator_name)
+
+    current = start_date
+    sheet_index = 0
+    while current <= end_date:
+        weekday_name = WEEKDAYS[current.weekday()]
+        for session_type, session_name in sessions:
+            sheet_name = f"{current.month}-{current.day}{session_name}{weekday_name}"
+            sheet_index += 1
+            try:
+                logging.info(f"[{sheet_index}/{total_sheets}] 创建工作表: {sheet_name}")
+                sheet_id = _create_one_sheet_from_template(token, doc_id, sheet_name, template_content)
+
+                # 同步数据库
+                db.insert_sheet(
+                    doc_id=doc_id,
+                    sheet_id=sheet_id,
+                    sheet_name=sheet_name,
+                    sheet_date=current.isoformat(),
+                    session_type=session_type,
+                    weekday=weekday_name,
+                    template_id=template_id,
+                    created_by=operator_userid
+                )
+                created_sheets.append({"sheet_name": sheet_name, "sheet_id": sheet_id})
+                success_count += 1
+            except Exception as e:
+                logging.error(f"创建工作表 {sheet_name} 失败: {e}")
+                failed_sheets.append({"sheet_name": sheet_name, "error": str(e)})
+                db.insert_log(
+                    operator_id=user_id,
+                    target_id=template_id,
+                    operation_type="create_bulk_sheets",
+                    target_type="sheet",
+                    detail={"sheet_name": sheet_name, "sheet_date": current.isoformat()},
+                    error_msg=str(e)
+                )
+        current += timedelta(days=1)
+
+    # 5. 汇总日志
+    db.insert_log(
+        operator_id=user_id,
+        target_id=template_id,
+        operation_type="create_bulk_sheets",
+        target_type="sheet",
+        detail={
+            "start_date": start_date.isoformat(),
+            "end_date": end_date.isoformat(),
+            "total": total_sheets,
+            "success": success_count,
+            "failed": len(failed_sheets)
+        }
+    )
+
+    return {
+        "success_count": success_count,
+        "failed_count": len(failed_sheets),
+        "failed_sheets": failed_sheets,
+        "created_sheets": created_sheets,
+        "start_date": start_date.isoformat(),
+        "end_date": end_date.isoformat()
+    }

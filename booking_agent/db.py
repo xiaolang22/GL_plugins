@@ -175,6 +175,33 @@ def get_template(template_id):
         return result
     return None
 
+def get_first_template():
+    """获取第一条模板记录（含 template_content 解析后的 dict），用于批量创建工作表"""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute('SELECT * FROM templates ORDER BY id LIMIT 1')
+    row = cursor.fetchone()
+    conn.close()
+    if row:
+        result = dict(row)
+        if result.get("template_content"):
+            result["template_content"] = json.loads(result["template_content"])
+        return result
+    return None
+
+def insert_sheet(doc_id, sheet_id, sheet_name, sheet_date, session_type, weekday, template_id, created_by):
+    """插入普通工作表记录"""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT INTO sheets (doc_id, sheet_id, sheet_name, sheet_date, session_type, weekday, template_id, created_by)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    ''', (doc_id, sheet_id, sheet_name, sheet_date, session_type, weekday, template_id, created_by))
+    conn.commit()
+    row_id = cursor.lastrowid
+    conn.close()
+    return row_id
+
 def get_templates(doc_id=None):
     """获取模板列表，可按 doc_id 过滤"""
     conn = get_connection()

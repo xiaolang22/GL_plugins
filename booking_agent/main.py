@@ -9,7 +9,7 @@ import uvicorn
 sys.path.append(os.path.dirname(__file__))
 
 from db import init_db
-from composite import create_smart_sheet_and_sync, create_template_sheet_and_sync, SEAT_DATA
+from composite import create_smart_sheet_and_sync, create_template_sheet_and_sync, create_bulk_sheets_and_sync, SEAT_DATA
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -17,6 +17,8 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 CORP_ID = "ww742ff47a509b856e"
 SECRET = "Iu6AYICGeiAe2kx3YyTSefTEZsld42U6EkGsQ2ON2QA"
 DEFAULT_ADMIN_USERS = ["ChenDaHong"]  # 可指定初始管理员 userid 列表
+BULK_SHEETS_MONTHS = 3  # 批量新建工作表时，默认创建未来几个月
+SESSIONS = [("lunch", "午市"), ("dinner", "晚市")]  # 一天的市场配置：(session_type, 显示名)，按顺序创建
 # ===========================================
 
 app = FastAPI()
@@ -66,6 +68,41 @@ async def tool_create_template(request: Request):
         }
     except Exception as e:
         logging.error(f"创建模板工作表失败: {e}")
+        return {"content": f"❌ 操作失败: {str(e)}"}
+
+@app.post("/create_bulk_sheets")
+async def tool_create_bulk_sheets(request: Request):
+    """工具3：批量新建工作表（默认未来三个月，每天午市+晚市）"""
+    try:
+        body = await request.json()
+        operator_userid = body.get("operator_userid", "system")
+        operator_name = body.get("operator_name", "系统")
+        months = body.get("months", BULK_SHEETS_MONTHS)
+        sessions = body.get("sessions", SESSIONS)
+
+        result = create_bulk_sheets_and_sync(
+            CORP_ID, SECRET, operator_userid, operator_name,
+            months=months, sessions=sessions
+        )
+        msg = (
+            f"✅ 批量创建完成：{result['start_date']} ~ {result['end_date']}\n"
+            f"📊 成功 {result['success_count']} 张，失败 {result['failed_count']} 张"
+        )
+        if result["failed_sheets"]:
+            failed_summary = "；".join(
+                f"{f['sheet_name']}({f['error'][:30]})" for f in result["failed_sheets"][:5]
+            )
+            msg += f"\n⚠️ 失败明细（前5条）：{failed_summary}"
+        return {
+            "content": msg,
+            "success_count": result["success_count"],
+            "failed_count": result["failed_count"],
+            "failed_sheets": result["failed_sheets"],
+            "start_date": result["start_date"],
+            "end_date": result["end_date"]
+        }
+    except Exception as e:
+        logging.error(f"批量创建工作表失败: {e}")
         return {"content": f"❌ 操作失败: {str(e)}"}
 
 @app.get("/health")
