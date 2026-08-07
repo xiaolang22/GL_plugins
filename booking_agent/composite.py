@@ -1,5 +1,6 @@
 import logging
 import calendar
+import httpx
 from datetime import date, timedelta
 from typing import List, Dict, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -64,10 +65,11 @@ def create_smart_sheet_and_sync(corp_id: str, secret: str, doc_name: str, admin_
     复合操作1：创建智能表格并同步到数据库
     返回: {"doc_id": "...", "doc_url": "...", "db_id": ...}
     """
-    token = api_wework.get_access_token(corp_id, secret)
-    result = api_wework.create_doc(token, doc_name, admin_users)
-    doc_id = result["docid"]
-    doc_url = result["url"]
+    with httpx.Client(timeout=30) as client:
+        token = api_wework.get_access_token(client, corp_id, secret)
+        result = api_wework.create_doc(client, token, doc_name, admin_users)
+        doc_id = result["docid"]
+        doc_url = result["url"]
 
     # 插入数据库
     db_id = db.insert_doc(doc_id, doc_name, doc_url, operator_userid)
@@ -94,92 +96,93 @@ def create_template_sheet_and_sync(corp_id: str, secret: str, template_name: str
     if not doc_id:
         raise Exception("没有找到已存在的智能表格，请先创建智能表格")
 
-    token = api_wework.get_access_token(corp_id, secret)
+    with httpx.Client(timeout=30) as client:
+        token = api_wework.get_access_token(client, corp_id, secret)
 
-    # 1. 添加子表
-    sheet_result = api_wework.add_sheet(token, doc_id, template_name)
-    sheet_id = sheet_result["properties"]["sheet_id"]
+        # 1. 添加子表
+        sheet_result = api_wework.add_sheet(client, token, doc_id, template_name)
+        sheet_id = sheet_result["properties"]["sheet_id"]
 
-    # 1.5 将子表自带的默认字段重命名为第一个字段"座位名称"
-    # （add_sheet 会自动创建一个默认文本字段，子表至少需保留一个字段，不能直接删除）
-    existing_fields = api_wework.get_fields(token, doc_id, sheet_id)
-    default_fields = existing_fields.get("fields", [])
-    if default_fields:
-        default_field_id = default_fields[0]["field_id"]
-        api_wework.update_fields(token, doc_id, sheet_id, [{
-            "field_id": default_field_id,
-            "field_title": "座位名称",
-            "field_type": "FIELD_TYPE_TEXT"
-        }])
+        # 1.5 将子表自带的默认字段重命名为第一个字段"座位名称"
+        # （add_sheet 会自动创建一个默认文本字段，子表至少需保留一个字段，不能直接删除）
+        existing_fields = api_wework.get_fields(client, token, doc_id, sheet_id)
+        default_fields = existing_fields.get("fields", [])
+        if default_fields:
+            default_field_id = default_fields[0]["field_id"]
+            api_wework.update_fields(client, token, doc_id, sheet_id, [{
+                "field_id": default_field_id,
+                "field_title": "座位名称",
+                "field_type": "FIELD_TYPE_TEXT"
+            }])
 
-    # 2. 添加剩余 9 个字段（"座位名称"已通过重命名默认字段获得，保持第一列）
-    # 需求从左到右顺序：座位名称(已有)、座位容量、座位备注、客人称呼、客人电话、人数、留菜、留位人、座位类型、是否已订
-    # 注意：add_fields 会将新字段**前置插入**（插入到最左侧），因此需要按逆序传入，才能得到正确从左到右顺序
-    fields = [
-        {
-            "field_title": "是否已订",
-            "field_type": "FIELD_TYPE_SINGLE_SELECT",
-            "property_single_select": {
-                "options": [{"text": "已订座"}, {"text": "未订座"}]
-            }
-        },
-        {
-            "field_title": "座位类型",
-            "field_type": "FIELD_TYPE_SINGLE_SELECT",
-            "property_single_select": {
-                "options": [{"text": "房间"}, {"text": "大厅"}]
-            }
-        },
-        {"field_title": "留位人", "field_type": "FIELD_TYPE_TEXT"},
-        {"field_title": "留菜", "field_type": "FIELD_TYPE_TEXT"},
-        {"field_title": "人数", "field_type": "FIELD_TYPE_TEXT"},
-        {"field_title": "客人电话", "field_type": "FIELD_TYPE_TEXT"},
-        {"field_title": "客人称呼", "field_type": "FIELD_TYPE_TEXT"},
-        {"field_title": "座位备注", "field_type": "FIELD_TYPE_TEXT"},
-        {"field_title": "座位容量", "field_type": "FIELD_TYPE_TEXT"},
-    ]
-    api_wework.add_fields(token, doc_id, sheet_id, fields)
+        # 2. 添加剩余 9 个字段（"座位名称"已通过重命名默认字段获得，保持第一列）
+        # 需求从左到右顺序：座位名称(已有)、座位容量、座位备注、客人称呼、客人电话、人数、留菜、留位人、座位类型、是否已订
+        # 注意：add_fields 会将新字段**前置插入**（插入到最左侧），因此需要按逆序传入，才能得到正确从左到右顺序
+        fields = [
+            {
+                "field_title": "是否已订",
+                "field_type": "FIELD_TYPE_SINGLE_SELECT",
+                "property_single_select": {
+                    "options": [{"text": "已订座"}, {"text": "未订座"}]
+                }
+            },
+            {
+                "field_title": "座位类型",
+                "field_type": "FIELD_TYPE_SINGLE_SELECT",
+                "property_single_select": {
+                    "options": [{"text": "房间"}, {"text": "大厅"}]
+                }
+            },
+            {"field_title": "留位人", "field_type": "FIELD_TYPE_TEXT"},
+            {"field_title": "留菜", "field_type": "FIELD_TYPE_TEXT"},
+            {"field_title": "人数", "field_type": "FIELD_TYPE_TEXT"},
+            {"field_title": "客人电话", "field_type": "FIELD_TYPE_TEXT"},
+            {"field_title": "客人称呼", "field_type": "FIELD_TYPE_TEXT"},
+            {"field_title": "座位备注", "field_type": "FIELD_TYPE_TEXT"},
+            {"field_title": "座位容量", "field_type": "FIELD_TYPE_TEXT"},
+        ]
+        api_wework.add_fields(client, token, doc_id, sheet_id, fields)
 
-    # 3. 添加记录
-    # 文本字段值需为 [{"type": "text", "text": "..."}]，单选字段值需为 [{"text": "..."}]
-    def text_value(s):
-        return [{"type": "text", "text": str(s)}]
+        # 3. 添加记录
+        # 文本字段值需为 [{"type": "text", "text": "..."}]，单选字段值需为 [{"text": "..."}]
+        def text_value(s):
+            return [{"type": "text", "text": str(s)}]
 
-    def select_value(s):
-        return [{"text": str(s)}]
+        def select_value(s):
+            return [{"text": str(s)}]
 
-    records = []
-    for name, capacity, remark, seat_type in SEAT_DATA:
-        records.append({
-            "values": {
-                "座位名称": text_value(name),
-                "座位容量": text_value(capacity),
-                "座位备注": text_value(remark),
-                "座位类型": select_value(seat_type),
-                "是否已订": select_value("未订座")
-            }
-        })
-    api_wework.add_records(token, doc_id, sheet_id, records)
+        records = []
+        for name, capacity, remark, seat_type in SEAT_DATA:
+            records.append({
+                "values": {
+                    "座位名称": text_value(name),
+                    "座位容量": text_value(capacity),
+                    "座位备注": text_value(remark),
+                    "座位类型": select_value(seat_type),
+                    "是否已订": select_value("未订座")
+                }
+            })
+        api_wework.add_records(client, token, doc_id, sheet_id, records)
 
-    # 4. 设置分组规则：1.按是否已订选项正序；2.按座位类型选项正序
-    # 需要先获取"座位类型"和"是否已订"字段的 field_id，以及默认视图的 view_id
-    all_fields = api_wework.get_fields(token, doc_id, sheet_id)
-    field_id_map = {f["field_title"]: f["field_id"] for f in all_fields.get("fields", [])}
-    seat_type_field_id = field_id_map.get("座位类型")
-    is_booked_field_id = field_id_map.get("是否已订")
+        # 4. 设置分组规则：1.按是否已订选项正序；2.按座位类型选项正序
+        # 需要先获取"座位类型"和"是否已订"字段的 field_id，以及默认视图的 view_id
+        all_fields = api_wework.get_fields(client, token, doc_id, sheet_id)
+        field_id_map = {f["field_title"]: f["field_id"] for f in all_fields.get("fields", [])}
+        seat_type_field_id = field_id_map.get("座位类型")
+        is_booked_field_id = field_id_map.get("是否已订")
 
-    views_result = api_wework.get_views(token, doc_id, sheet_id)
-    views = views_result.get("views", [])
-    if views and seat_type_field_id and is_booked_field_id:
-        default_view_id = views[0]["view_id"]
-        api_wework.update_view(token, doc_id, sheet_id, default_view_id, {
-            "group_spec": {
-                "groups": [
-                    {"field_id": is_booked_field_id, "desc": False},
-                    {"field_id": seat_type_field_id, "desc": False}
-                ]
-            }
-        })
+        views_result = api_wework.get_views(client, token, doc_id, sheet_id)
+        views = views_result.get("views", [])
+        if views and seat_type_field_id and is_booked_field_id:
+            default_view_id = views[0]["view_id"]
+            api_wework.update_view(client, token, doc_id, sheet_id, default_view_id, {
+                "group_spec": {
+                    "groups": [
+                        {"field_id": is_booked_field_id, "desc": False},
+                        {"field_id": seat_type_field_id, "desc": False}
+                    ]
+                }
+            })
 
     # 5. 构造模板内容 JSON（与实际创建的模板结构一致，便于后续复用）
     # 5.1 字段定义（按从左到右顺序）
@@ -275,7 +278,7 @@ def _build_record_payload(record: Dict, fields_def: List[Dict]) -> Dict:
     return {"values": values}
 
 
-def _fill_sheet_from_template(token: str, doc_id: str, sheet_id: str, template_content: Dict) -> None:
+def _fill_sheet_from_template(client: httpx.Client, token: str, doc_id: str, sheet_id: str, template_content: Dict) -> None:
     """填充子表（幂等）：重命名默认字段 → 添加缺失字段 → 添加记录 → 设置分组规则
 
     幂等性设计（用于阶段三重试场景，避免重复添加）：
@@ -287,14 +290,14 @@ def _fill_sheet_from_template(token: str, doc_id: str, sheet_id: str, template_c
     first_field = fields_def[0]
 
     # 1. 检查现有字段，判断哪些步骤需要执行
-    existing_fields_resp = api_wework.get_fields(token, doc_id, sheet_id)
+    existing_fields_resp = api_wework.get_fields(client, token, doc_id, sheet_id)
     existing_fields = existing_fields_resp.get("fields", [])
     existing_titles = {f["field_title"] for f in existing_fields}
 
     # 1a. 重命名默认字段（如果第一个字段标题尚不存在，说明默认字段还未被重命名）
     if first_field["field_title"] not in existing_titles and existing_fields:
         default_field_id = existing_fields[0]["field_id"]
-        api_wework.update_fields(token, doc_id, sheet_id, [{
+        api_wework.update_fields(client, token, doc_id, sheet_id, [{
             "field_id": default_field_id,
             "field_title": first_field["field_title"],
             "field_type": first_field["field_type"]
@@ -305,23 +308,23 @@ def _fill_sheet_from_template(token: str, doc_id: str, sheet_id: str, template_c
     missing_fields = [f for f in fields_def[1:] if f["field_title"] not in existing_titles]
     if missing_fields:
         rest_payload = [_build_field_payload(f) for f in reversed(missing_fields)]
-        api_wework.add_fields(token, doc_id, sheet_id, rest_payload)
+        api_wework.add_fields(client, token, doc_id, sheet_id, rest_payload)
 
     # 3. 添加记录（仅在无记录时添加，保证幂等）
-    records_resp = api_wework.get_records(token, doc_id, sheet_id, limit=1)
+    records_resp = api_wework.get_records(client, token, doc_id, sheet_id, limit=1)
     existing_count = records_resp.get("total", len(records_resp.get("records", [])))
     if existing_count == 0:
         records = [_build_record_payload(rec, fields_def) for rec in template_content.get("records", [])]
         if records:
-            api_wework.add_records(token, doc_id, sheet_id, records)
+            api_wework.add_records(client, token, doc_id, sheet_id, records)
 
     # 4. 设置分组规则（覆盖写入，天然幂等）
     group_spec = template_content.get("group_spec", {})
     groups_def = group_spec.get("groups", [])
     if groups_def:
-        all_fields_resp = api_wework.get_fields(token, doc_id, sheet_id)
+        all_fields_resp = api_wework.get_fields(client, token, doc_id, sheet_id)
         field_id_map = {f["field_title"]: f["field_id"] for f in all_fields_resp.get("fields", [])}
-        views_result = api_wework.get_views(token, doc_id, sheet_id)
+        views_result = api_wework.get_views(client, token, doc_id, sheet_id)
         views = views_result.get("views", [])
         if views:
             view_id = views[0]["view_id"]
@@ -331,16 +334,16 @@ def _fill_sheet_from_template(token: str, doc_id: str, sheet_id: str, template_c
                 if fid:
                     groups.append({"field_id": fid, "desc": g.get("desc", False)})
             if groups:
-                api_wework.update_view(token, doc_id, sheet_id, view_id, {
+                api_wework.update_view(client, token, doc_id, sheet_id, view_id, {
                     "group_spec": {"groups": groups}
                 })
 
 
-def _create_one_sheet_from_template(token: str, doc_id: str, sheet_name: str, template_content: Dict) -> str:
+def _create_one_sheet_from_template(client: httpx.Client, token: str, doc_id: str, sheet_name: str, template_content: Dict) -> str:
     """按模板内容创建一张工作表（串行版，供单张创建场景使用），返回 sheet_id"""
-    sheet_result = api_wework.add_sheet(token, doc_id, sheet_name)
+    sheet_result = api_wework.add_sheet(client, token, doc_id, sheet_name)
     sheet_id = sheet_result["properties"]["sheet_id"]
-    _fill_sheet_from_template(token, doc_id, sheet_id, template_content)
+    _fill_sheet_from_template(client, token, doc_id, sheet_id, template_content)
     return sheet_id
 
 
@@ -388,98 +391,100 @@ def create_bulk_sheets_and_sync(corp_id: str, secret: str, operator_userid: str,
     if not template_content:
         raise Exception("模板内容为空，无法复刻工作表")
 
-    token = api_wework.get_access_token(corp_id, secret)
+    with httpx.Client(timeout=30) as client:
+        token = api_wework.get_access_token(client, corp_id, secret)
 
-    # 3. 计算日期范围（从今天到 months 个月后的同一天前一天，与需求示例一致：6月1日 → 8月31日）
-    start_date = date.today()
-    end_date = _add_months(start_date, months) - timedelta(days=1)
+        # 3. 计算日期范围（从今天到 months 个月后的同一天前一天，与需求示例一致：6月1日 → 8月31日）
+        start_date = date.today()
+        end_date = _add_months(start_date, months) - timedelta(days=1)
 
-    # 4. 构建任务列表（按日期顺序排列，确保阶段一串行创建的子表顺序正确）
-    tasks = []  # 每项: {"sheet_name", "sheet_date", "session_type", "weekday"}
-    current = start_date
-    while current <= end_date:
-        weekday_name = WEEKDAYS[current.weekday()]
-        for session_type, session_name in sessions:
-            sheet_name = f"{current.month}-{current.day}{session_name}{weekday_name}"
-            tasks.append({
-                "sheet_name": sheet_name,
-                "sheet_date": current.isoformat(),
-                "session_type": session_type,
-                "weekday": weekday_name,
-            })
-        current += timedelta(days=1)
+        # 4. 构建任务列表（按日期顺序排列，确保阶段一串行创建的子表顺序正确）
+        tasks = []  # 每项: {"sheet_name", "sheet_date", "session_type", "weekday"}
+        current = start_date
+        while current <= end_date:
+            weekday_name = WEEKDAYS[current.weekday()]
+            for session_type, session_name in sessions:
+                sheet_name = f"{current.month}-{current.day}{session_name}{weekday_name}"
+                tasks.append({
+                    "sheet_name": sheet_name,
+                    "sheet_date": current.isoformat(),
+                    "session_type": session_type,
+                    "weekday": weekday_name,
+                })
+            current += timedelta(days=1)
 
-    total = len(tasks)
-    user_id = db.insert_user(operator_userid, operator_name)
-    logging.info(f"批量创建工作表：{start_date} ~ {end_date}，共 {total} 张，并发数 {max_workers}")
+        total = len(tasks)
+        user_id = db.insert_user(operator_userid, operator_name)
+        logging.info(f"批量创建工作表：{start_date} ~ {end_date}，共 {total} 张，并发数 {max_workers}")
 
-    # ==================== 阶段一：串行创建子表 ====================
-    # 串行调用 add_sheet，保证子表在企业微信文档中按日期顺序排列
-    logging.info(f"===== 阶段一：串行创建子表（{total} 张）=====")
-    phase1_created = []  # 成功创建子表的任务: [(task, sheet_id), ...]
-    phase1_failed = []   # 阶段一失败的任务: [(task, error), ...]
-    for i, task in enumerate(tasks, 1):
-        try:
-            logging.info(f"[1-{i}/{total}] 创建子表: {task['sheet_name']}")
-            sheet_result = api_wework.add_sheet(token, doc_id, task["sheet_name"])
-            sheet_id = sheet_result["properties"]["sheet_id"]
-            phase1_created.append((task, sheet_id))
-        except Exception as e:
-            logging.error(f"[1-{i}/{total}] 创建子表失败 {task['sheet_name']}: {e}")
-            phase1_failed.append((task, str(e)))
+        # ==================== 阶段一：串行创建子表 ====================
+        # 串行调用 add_sheet，保证子表在企业微信文档中按日期顺序排列
+        logging.info(f"===== 阶段一：串行创建子表（{total} 张）=====")
+        phase1_created = []  # 成功创建子表的任务: [(task, sheet_id), ...]
+        phase1_failed = []   # 阶段一失败的任务: [(task, error), ...]
+        for i, task in enumerate(tasks, 1):
+            try:
+                logging.info(f"[1-{i}/{total}] 创建子表: {task['sheet_name']}")
+                sheet_result = api_wework.add_sheet(client, token, doc_id, task["sheet_name"])
+                sheet_id = sheet_result["properties"]["sheet_id"]
+                phase1_created.append((task, sheet_id))
+            except Exception as e:
+                logging.error(f"[1-{i}/{total}] 创建子表失败 {task['sheet_name']}: {e}")
+                phase1_failed.append((task, str(e)))
 
-    logging.info(f"阶段一完成：成功 {len(phase1_created)} 张，失败 {len(phase1_failed)} 张")
+        logging.info(f"阶段一完成：成功 {len(phase1_created)} 张，失败 {len(phase1_failed)} 张")
 
-    # ==================== 阶段二：并发填充 ====================
-    # 对阶段一成功的子表，并发执行 _fill_sheet_from_template（字段/记录/分组规则）
-    to_fill_count = len(phase1_created)
-    logging.info(f"===== 阶段二：并发填充（{to_fill_count} 张，{max_workers} 路并发）=====")
+        # ==================== 阶段二：并发填充 ====================
+        # 对阶段一成功的子表，并发执行 _fill_sheet_from_template（字段/记录/分组规则）
+        # 共享 client 是线程安全的，连接池自动管理并发连接
+        to_fill_count = len(phase1_created)
+        logging.info(f"===== 阶段二：并发填充（{to_fill_count} 张，{max_workers} 路并发）=====")
 
-    def _fill_worker(task: Dict, sheet_id: str) -> Dict:
-        """并发填充 worker：仅做 API 调用，返回结果由主线程统一处理 DB"""
-        try:
-            _fill_sheet_from_template(token, doc_id, sheet_id, template_content)
-            return {"task": task, "sheet_id": sheet_id, "error": None}
-        except Exception as e:
-            return {"task": task, "sheet_id": sheet_id, "error": str(e)}
+        def _fill_worker(task: Dict, sheet_id: str) -> Dict:
+            """并发填充 worker：仅做 API 调用，返回结果由主线程统一处理 DB"""
+            try:
+                _fill_sheet_from_template(client, token, doc_id, sheet_id, template_content)
+                return {"task": task, "sheet_id": sheet_id, "error": None}
+            except Exception as e:
+                return {"task": task, "sheet_id": sheet_id, "error": str(e)}
 
-    phase2_success = []   # 阶段二直接成功: [(task, sheet_id), ...]
-    phase2_failed = []    # 阶段二失败（待重试）: [(task, sheet_id), ...]
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {
-            executor.submit(_fill_worker, task, sid): (task, sid)
-            for task, sid in phase1_created
-        }
-        for i, future in enumerate(as_completed(futures), 1):
-            result = future.result()
-            task = result["task"]
-            sheet_id = result["sheet_id"]
-            err = result["error"]
-            if err:
-                logging.error(f"[2-{i}/{to_fill_count}] 填充失败 {task['sheet_name']}: {err}")
-                phase2_failed.append((task, sheet_id, err))
-            else:
-                logging.info(f"[2-{i}/{to_fill_count}] 填充成功 {task['sheet_name']}")
-                phase2_success.append((task, sheet_id))
+        phase2_success = []   # 阶段二直接成功: [(task, sheet_id), ...]
+        phase2_failed = []    # 阶段二失败（待重试）: [(task, sheet_id), ...]
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(_fill_worker, task, sid): (task, sid)
+                for task, sid in phase1_created
+            }
+            for i, future in enumerate(as_completed(futures), 1):
+                result = future.result()
+                task = result["task"]
+                sheet_id = result["sheet_id"]
+                err = result["error"]
+                if err:
+                    logging.error(f"[2-{i}/{to_fill_count}] 填充失败 {task['sheet_name']}: {err}")
+                    phase2_failed.append((task, sheet_id, err))
+                else:
+                    logging.info(f"[2-{i}/{to_fill_count}] 填充成功 {task['sheet_name']}")
+                    phase2_success.append((task, sheet_id))
 
-    logging.info(f"阶段二完成：成功 {len(phase2_success)} 张，失败 {len(phase2_failed)} 张（待重试）")
+        logging.info(f"阶段二完成：成功 {len(phase2_success)} 张，失败 {len(phase2_failed)} 张（待重试）")
 
-    # ==================== 阶段三：串行重试 ====================
-    # 对阶段二失败的工作表，串行重试填充（_fill_sheet_from_template 是幂等的，可安全重试）
-    retry_count = len(phase2_failed)
-    logging.info(f"===== 阶段三：串行重试（{retry_count} 张）=====")
-    phase3_success = []  # 重试成功: [(task, sheet_id), ...]
-    phase3_failed = []   # 重试仍失败: [(task, sheet_id, error), ...]
-    for i, (task, sheet_id, _) in enumerate(phase2_failed, 1):
-        try:
-            logging.info(f"[3-{i}/{retry_count}] 重试填充: {task['sheet_name']}")
-            _fill_sheet_from_template(token, doc_id, sheet_id, template_content)
-            phase3_success.append((task, sheet_id))
-        except Exception as e:
-            logging.error(f"[3-{i}/{retry_count}] 重试失败 {task['sheet_name']}: {e}")
-            phase3_failed.append((task, sheet_id, str(e)))
+        # ==================== 阶段三：串行重试 ====================
+        # 对阶段二失败的工作表，串行重试填充（_fill_sheet_from_template 是幂等的，可安全重试）
+        retry_count = len(phase2_failed)
+        logging.info(f"===== 阶段三：串行重试（{retry_count} 张）=====")
+        phase3_success = []  # 重试成功: [(task, sheet_id), ...]
+        phase3_failed = []   # 重试仍失败: [(task, sheet_id, error), ...]
+        for i, (task, sheet_id, _) in enumerate(phase2_failed, 1):
+            try:
+                logging.info(f"[3-{i}/{retry_count}] 重试填充: {task['sheet_name']}")
+                _fill_sheet_from_template(client, token, doc_id, sheet_id, template_content)
+                phase3_success.append((task, sheet_id))
+            except Exception as e:
+                logging.error(f"[3-{i}/{retry_count}] 重试失败 {task['sheet_name']}: {e}")
+                phase3_failed.append((task, sheet_id, str(e)))
 
-    logging.info(f"阶段三完成：重试成功 {len(phase3_success)} 张，重试失败 {len(phase3_failed)} 张")
+        logging.info(f"阶段三完成：重试成功 {len(phase3_success)} 张，重试失败 {len(phase3_failed)} 张")
 
     # ==================== 同步数据库 ====================
     # 对所有最终成功的子表，写入 sheets 表（主线程串行写，避免 SQLite 并发问题）
