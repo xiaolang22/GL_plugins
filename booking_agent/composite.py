@@ -175,10 +175,55 @@ def create_template_sheet_and_sync(corp_id: str, secret: str, template_name: str
             }
         })
 
-    # 5. 同步数据库：插入模板记录
-    template_db_id = db.insert_template(doc_id, sheet_id, template_name, operator_userid)
+    # 5. 构造模板内容 JSON（与实际创建的模板结构一致，便于后续复用）
+    # 5.1 字段定义（按从左到右顺序）
+    template_fields = [
+        {"field_title": "座位名称", "field_type": "FIELD_TYPE_TEXT"},
+        {"field_title": "座位容量", "field_type": "FIELD_TYPE_TEXT"},
+        {"field_title": "座位备注", "field_type": "FIELD_TYPE_TEXT"},
+        {"field_title": "客人称呼", "field_type": "FIELD_TYPE_TEXT"},
+        {"field_title": "客人电话", "field_type": "FIELD_TYPE_TEXT"},
+        {"field_title": "人数", "field_type": "FIELD_TYPE_TEXT"},
+        {"field_title": "留菜", "field_type": "FIELD_TYPE_TEXT"},
+        {"field_title": "留位人", "field_type": "FIELD_TYPE_TEXT"},
+        {"field_title": "座位类型", "field_type": "FIELD_TYPE_SINGLE_SELECT", "options": ["房间", "大厅"]},
+        {"field_title": "是否已订", "field_type": "FIELD_TYPE_SINGLE_SELECT", "options": ["已订座", "未订座"]},
+    ]
 
-    # 6. 日志
+    # 5.2 记录数据（使用可读格式，而非 API 特定的 value 封装格式）
+    template_records = []
+    for name, capacity, remark, seat_type in SEAT_DATA:
+        template_records.append({
+            "座位名称": name,
+            "座位容量": str(capacity),
+            "座位备注": remark,
+            "客人称呼": "",
+            "客人电话": "",
+            "人数": "",
+            "留菜": "",
+            "留位人": "",
+            "座位类型": seat_type,
+            "是否已订": "未订座"
+        })
+
+    # 5.3 分组规则（使用字段标题而非动态 field_id，便于跨实例复用）
+    template_group_spec = {
+        "groups": [
+            {"field_title": "是否已订", "desc": False},
+            {"field_title": "座位类型", "desc": False}
+        ]
+    }
+
+    template_content = {
+        "fields": template_fields,
+        "records": template_records,
+        "group_spec": template_group_spec
+    }
+
+    # 6. 同步数据库：插入模板记录（含 template_content）
+    template_db_id = db.insert_template(doc_id, sheet_id, template_name, operator_userid, template_content)
+
+    # 7. 日志
     user_id = db.insert_user(operator_userid, operator_name)
     db.insert_log(
         operator_id=user_id,

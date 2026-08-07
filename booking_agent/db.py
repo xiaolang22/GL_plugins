@@ -85,6 +85,13 @@ def init_db():
         )
     ''')
 
+    # 迁移：为 templates 表添加 template_content 列（存储模板内容 JSON）
+    cursor.execute("PRAGMA table_info(templates)")
+    existing_columns = [row[1] for row in cursor.fetchall()]
+    if "template_content" not in existing_columns:
+        cursor.execute("ALTER TABLE templates ADD COLUMN template_content TEXT")
+        logging.info("数据库迁移：templates 表新增 template_content 列")
+
     conn.commit()
     conn.close()
     logging.info("数据库初始化完成")
@@ -101,13 +108,13 @@ def insert_doc(doc_id, doc_name, doc_url, created_by):
     conn.close()
     return row_id
 
-def insert_template(doc_id, sheet_id, sheet_name, created_by):
+def insert_template(doc_id, sheet_id, sheet_name, created_by, template_content=None):
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute('''
-        INSERT INTO templates (doc_id, sheet_id, sheet_name, created_by)
-        VALUES (?, ?, ?, ?)
-    ''', (doc_id, sheet_id, sheet_name, created_by))
+        INSERT INTO templates (doc_id, sheet_id, sheet_name, created_by, template_content)
+        VALUES (?, ?, ?, ?, ?)
+    ''', (doc_id, sheet_id, sheet_name, created_by, json.dumps(template_content, ensure_ascii=False) if template_content else None))
     conn.commit()
     row_id = cursor.lastrowid
     conn.close()
@@ -153,3 +160,35 @@ def insert_log(operator_id, target_id, operation_type, target_type, detail=None,
     row_id = cursor.lastrowid
     conn.close()
     return row_id
+
+def get_template(template_id):
+    """根据 id 获取模板记录（含 template_content 解析后的 dict）"""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute('SELECT * FROM templates WHERE id = ?', (template_id,))
+    row = cursor.fetchone()
+    conn.close()
+    if row:
+        result = dict(row)
+        if result.get("template_content"):
+            result["template_content"] = json.loads(result["template_content"])
+        return result
+    return None
+
+def get_templates(doc_id=None):
+    """获取模板列表，可按 doc_id 过滤"""
+    conn = get_connection()
+    cursor = conn.cursor()
+    if doc_id:
+        cursor.execute('SELECT * FROM templates WHERE doc_id = ? ORDER BY id', (doc_id,))
+    else:
+        cursor.execute('SELECT * FROM templates ORDER BY id')
+    rows = cursor.fetchall()
+    conn.close()
+    results = []
+    for row in rows:
+        item = dict(row)
+        if item.get("template_content"):
+            item["template_content"] = json.loads(item["template_content"])
+        results.append(item)
+    return results
