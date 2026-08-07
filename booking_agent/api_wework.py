@@ -143,3 +143,22 @@ def add_records(access_token: str, docid: str, sheet_id: str, records: List[Dict
     if result.get("errcode") != 0:
         raise Exception(f"添加记录失败: {result}")
     return result
+
+def get_records(access_token: str, docid: str, sheet_id: str, offset: int = 0, limit: int = 100, view_id: str = None, key_word: str = None) -> Dict[str, Any]:
+    """查询记录（用于幂等性检查：判断记录是否已存在）"""
+    url = f"https://qyapi.weixin.qq.com/cgi-bin/wedoc/smartsheet/get_records?access_token={access_token}"
+    payload = {
+        "docid": docid,
+        "sheet_id": sheet_id,
+        "offset": offset,
+        "limit": limit
+    }
+    if view_id:
+        payload["view_id"] = view_id
+    if key_word:
+        payload["key_word"] = key_word
+    resp = httpx.post(url, json=payload)
+    result = resp.json()
+    if result.get("errcode") != 0:
+        raise Exception(f"查询记录失败: {result}")
+    return result  # 包含 total, records, next_offset
