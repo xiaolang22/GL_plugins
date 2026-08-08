@@ -1,6 +1,7 @@
 import logging
 import calendar
 import httpx
+import time
 from datetime import date, datetime, timedelta
 from typing import List, Dict, Any, Tuple, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -9,6 +10,44 @@ import db
 
 # 星期名称（与 date.weekday() 0=周一 对应）
 WEEKDAYS = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+
+# ==================== 时间偏移封装（用于测试时模拟日期跳转）====================
+# 正数 = 向未来偏移 N 天，负数 = 向过去偏移 N 天，0 = 不偏移
+_TIME_OFFSET_DAYS: int = 0
+
+
+def set_time_offset_days(days: int) -> None:
+    """设置时间偏移（天数），用于测试模拟日期跳转"""
+    global _TIME_OFFSET_DAYS
+    _TIME_OFFSET_DAYS = int(days)
+    logging.info(f"[时间偏移] 设置为 {_TIME_OFFSET_DAYS} 天")
+
+
+def clear_time_offset_days() -> None:
+    """清除时间偏移，恢复真实时间"""
+    global _TIME_OFFSET_DAYS
+    _TIME_OFFSET_DAYS = 0
+    logging.info("[时间偏移] 已清除，使用真实时间")
+
+
+def get_time_offset_days() -> int:
+    """获取当前时间偏移天数"""
+    return _TIME_OFFSET_DAYS
+
+
+def get_virtual_today() -> date:
+    """获取"虚拟今天"：真实今天 + 时间偏移。所有日期计算统一使用此函数。"""
+    return date.today() + timedelta(days=_TIME_OFFSET_DAYS)
+
+
+def get_virtual_now() -> datetime:
+    """获取"虚拟当前时间"：真实当前时间 + 时间偏移"""
+    return datetime.now() + timedelta(days=_TIME_OFFSET_DAYS)
+
+
+# ==================== 智能表总限额 ====================
+MAX_SHEETS_LIMIT = 255
+BUFFER_DAYS_PAST = 7  # buffer 向前覆盖过去几天（不含今天）
 
 # 座位数据（按顺序）
 SEAT_DATA = [
@@ -1528,4 +1567,409 @@ def query_records_and_sync(
         "total": total_count,
         "booked_count": booked_count,
         "available_count": available_count,
+    }
+
+
+# ============================================================
+# 工具10：自动化 buffer 管理（每日零点执行）
+# ============================================================
+
+def _calc_buffer_range(months: int, today: date = None) -> Tuple[date, date]:
+    """计算 buffer 时间范围
+    - buffer_start: 今天 - BUFFER_DAYS_PAST 天（不含今天 → 严格小于今天）
+    - buffer_end:   与批量创建子表计算一致：当月第一天加 months 个月再减 1 天
+    返回 (buffer_start, buffer_end)
+    """
+    if today is None:
+        today = get_virtual_today()
+
+    # 过去 N 天（不含今天）：例 今天=6.8，N=7 → start=6.1（即 date < today 且 >= start）
+    buffer_start = today - timedelta(days=BUFFER_DAYS_PAST)
+
+    # 未来 buffer_end：与批量创建保持一致
+    # 取当月第一天，加 months 个月，再减 1 天
+    first_day_of_month = today.replace(day=1)
+    buffer_end = _add_months(first_day_of_month, months) - timedelta(days=1)
+
+    # buffer_end 如果小于今天（极端情况），至少保证到今天
+    if buffer_end < today:
+        buffer_end = today
+
+    return buffer_start, buffer_end
+
+
+def _delete_expired_sheets_remote(
+    client: httpx.Client,
+    token: str,
+    doc_id: str,
+    expired_list: List[Dict],
+) -> Tuple[List[Dict], List[Dict]]:
+    """串行删除远端过期离散工作表
+    传入: [{"sheet_id": ..., "sheet_name": ..., "sheet_date": ...}, ...]
+    返回: (success_list, failed_list)
+    """
+    success = []
+    failed = []
+
+    # 先确认远端至少保留 1 张子表（企业微信限制：不能删光）
+    try:
+        sheet_list_resp = api_wework.get_sheet_list(client, token, doc_id)
+        remote_sheets = sheet_list_resp.get("sheet_list", [])
+        remote_count = len(remote_sheets)
+    except Exception as e:
+        logging.error(f"[buffer] 获取远端子表列表失败，暂停删除：{e}")
+        return success, [{"sheet_name": s.get("sheet_name"), "error": f"get_sheet_list failed: {e}"} for s in expired_list]
+
+    remaining_protected = remote_count  # 剩余远端子表数（用于保护最后一张）
+
+    for item in expired_list:
+        sheet_id = item["sheet_id"]
+        sheet_name = item["sheet_name"]
+        try:
+            if remaining_protected <= 1:
+                logging.warning(f"[buffer] 跳过删除 {sheet_name}：远端仅剩最后 {remaining_protected} 张子表")
+                failed.append({"sheet_id": sheet_id, "sheet_name": sheet_name, "error": "最后一张子表保护"})
+                continue
+            api_wework.delete_sheet(client, token, doc_id, sheet_id)
+            success.append({"sheet_id": sheet_id, "sheet_name": sheet_name, "sheet_date": item["sheet_date"]})
+            remaining_protected -= 1
+            logging.info(f"[buffer] 删除过期表成功: {sheet_name}")
+        except Exception as e:
+            logging.error(f"[buffer] 删除过期表失败 {sheet_name}: {e}")
+            failed.append({"sheet_id": sheet_id, "sheet_name": sheet_name, "error": str(e)})
+
+    return success, failed
+
+
+def _supplement_new_sheets(
+    client: httpx.Client,
+    token: str,
+    doc_id: str,
+    template: Dict,
+    template_id: int,
+    today: date,
+    sessions: List[Tuple[str, str]],
+    current_total: int,
+    operator_userid: str,
+    operator_name: str,
+) -> Dict[str, Any]:
+    """补足 buffer 范围内的新工作表
+    - 从 max(buffer_max_date + 1 day, today) 开始创建，直到 buffer_end
+    - 创建前检查 255 限额，超过则截断
+    - 只补新表，不补中间缺表（buffer 内用户手动删除的表不自动补）
+    - 串行创建（保持顺序，量一般不大）
+    返回 {created, skipped_due_to_limit, start_date, end_date}
+    """
+    template_content = template.get("template_content")
+    if not template_content:
+        raise Exception("模板内容为空，无法补足工作表")
+
+    # 计算 buffer_end
+    # buffer_end 已经由主流程算出并用于标记 is_buffer
+    # 这里通过 db.get_buffer_max_date 获取当前实际上界
+    buffer_max_date_str = db.get_buffer_max_date()
+    if buffer_max_date_str:
+        buffer_max_date = date.fromisoformat(buffer_max_date_str)
+    else:
+        # 没有任何 buffer 记录时，从今天开始补
+        buffer_max_date = today - timedelta(days=1)
+
+    # 起始补表日期：buffer_max_date 的下一天，但不能早于今天（今天和未来才需要补）
+    start_supplement = max(buffer_max_date + timedelta(days=1), today)
+
+    # buffer_end：和批量创建一致（重新调用统一函数）
+    _buf_start, buffer_end = _calc_buffer_range(BULK_SHEETS_MONTHS_CACHE, today)
+    # 注：BULK_SHEETS_MONTHS_CACHE 由调用方在模块内注入，实际在主流程传 months 参数
+    # 为避免耦合，这里直接通过参数传 months 的值由外部传入（看下面实际调用点）
+
+    created = []
+    skipped_due_to_limit = []
+    running_total = current_total
+
+    # 遍历从 start_supplement 到 buffer_end（含）
+    current = start_supplement
+    while current <= buffer_end:
+        weekday_name = WEEKDAYS[current.weekday()]
+        for session_type, session_label in sessions:
+            # 先检查 255 限额
+            if running_total >= MAX_SHEETS_LIMIT:
+                skip_name = f"{current.month}-{current.day}{session_label}{weekday_name}"
+                skipped_due_to_limit.append({
+                    "sheet_name": skip_name,
+                    "sheet_date": current.isoformat(),
+                    "session_type": session_type,
+                    "reason": f"达到 {MAX_SHEETS_LIMIT} 限制（当前 {running_total}）",
+                })
+                logging.warning(f"[buffer] 跳过补表 {skip_name}：达到 {MAX_SHEETS_LIMIT} 上限")
+                continue
+
+            sheet_name = f"{current.month}-{current.day}{session_label}{weekday_name}"
+            # 查重（本地 DB）
+            if db.sheet_name_exists(sheet_name):
+                continue  # 已存在就跳过（理论上不会，因为是 buffer_max_date 之后）
+
+            try:
+                # 阶段一：创建子表
+                add_result = api_wework.add_sheet(client, token, doc_id, sheet_name)
+                sheet_id = add_result["properties"]["sheet_id"]
+
+                # 阶段二：填充（单张，直接调用）
+                _fill_sheet_from_template(client, token, doc_id, sheet_id, template_content)
+
+                # 入库
+                db.insert_sheet(
+                    doc_id=doc_id,
+                    sheet_id=sheet_id,
+                    sheet_name=sheet_name,
+                    sheet_date=current.isoformat(),
+                    session_type=session_type,
+                    weekday=weekday_name,
+                    template_id=template_id,
+                    created_by=operator_userid,
+                    is_buffer=1,
+                )
+
+                created.append({
+                    "sheet_name": sheet_name,
+                    "sheet_id": sheet_id,
+                    "sheet_date": current.isoformat(),
+                    "session_type": session_type,
+                })
+                running_total += 1
+                logging.info(f"[buffer] 补表成功: {sheet_name}（总表数 {running_total}）")
+            except Exception as e:
+                logging.error(f"[buffer] 补表失败 {sheet_name}: {e}")
+                # 失败不中断，继续下一张
+
+        current += timedelta(days=1)
+
+    return {
+        "created": created,
+        "created_count": len(created),
+        "skipped_due_to_limit": skipped_due_to_limit,
+        "skipped_count": len(skipped_due_to_limit),
+        "start_date": start_supplement.isoformat() if start_supplement <= buffer_end else None,
+        "end_date": buffer_end.isoformat(),
+    }
+
+
+# 缓存：补新表时需要知道 BULK_SHEETS_MONTHS，由 main.py 初始化时注入
+BULK_SHEETS_MONTHS_CACHE = 3
+
+
+def set_bulk_months_cache(months: int) -> None:
+    """设置批量创建月份数缓存（供 buffer 计算复用）"""
+    global BULK_SHEETS_MONTHS_CACHE
+    BULK_SHEETS_MONTHS_CACHE = int(months)
+
+
+def buffer_manage_and_sync(
+    corp_id: str,
+    secret: str,
+    operator_userid: str,
+    operator_name: str,
+    months: int = None,
+    sessions: List[Tuple[str, str]] = None,
+    past_days: int = None,
+) -> Dict[str, Any]:
+    """buffer 自动管理主流程（每日零点执行 / 测试手动触发）
+
+    执行顺序（严格按用户要求）：
+      1. 更新 buffer 范围标记（is_buffer 字段）
+      2. 删除过期离散工作表（sheet_date < 今天 且 is_buffer = 0）
+      3. （新建表之前检查是否超限）补足 buffer 上新工作表
+
+    参数:
+        months:     buffer 未来几个月（默认用缓存值）
+        sessions:   场次配置（默认午市+晚市）
+        past_days:  buffer 过去几天（默认用常量 BUFFER_DAYS_PAST）
+
+    返回: 各阶段统计明细
+    """
+    if months is None:
+        months = BULK_SHEETS_MONTHS_CACHE
+    if sessions is None:
+        sessions = [("lunch", "午市"), ("dinner", "晚市")]
+    if past_days is None:
+        past_days = BUFFER_DAYS_PAST
+
+    today = get_virtual_today()
+    today_str = today.isoformat()
+    logging.info(f"[buffer] ==== 开始执行 buffer 管理 ====")
+    logging.info(f"[buffer] 虚拟今天 = {today_str}（偏移 {get_time_offset_days()} 天）")
+    logging.info(f"[buffer] 参数：months={months}, past_days={past_days}, sessions={sessions}")
+
+    # ---------- 准备数据 ----------
+    doc_id = db.get_first_doc()
+    if not doc_id:
+        raise Exception("数据库中没有智能表格，请先调用 /create_doc 创建")
+    template = db.get_first_template()
+    if not template:
+        raise Exception("数据库中没有模板工作表，请先调用 /create_template 创建")
+    template_id = template["id"]
+
+    user_id = db.insert_user(operator_userid, operator_name)
+
+    # ------------ 步骤 1：更新 buffer 范围标记 ------------
+    buffer_start, buffer_end = _calc_buffer_range(months, today)
+    buffer_start_str = buffer_start.isoformat()
+    buffer_end_str = buffer_end.isoformat()
+    logging.info(f"[buffer] 步骤1：buffer 范围 [{buffer_start_str}, {buffer_end_str}]")
+
+    updated_count = db.update_buffer_flags(buffer_start_str, buffer_end_str)
+    logging.info(f"[buffer] 步骤1完成：更新了 {updated_count} 条记录的 is_buffer 标记")
+
+    step1_result = {
+        "buffer_start": buffer_start_str,
+        "buffer_end": buffer_end_str,
+        "updated_rows": updated_count,
+    }
+
+    # ------------ 步骤 2：删除过期离散工作表 ------------
+    # 条件：sheet_date < today（严格小于今天） 且 is_buffer = 0
+    logging.info(f"[buffer] 步骤2：查询过期离散工作表（sheet_date < {today_str} 且 is_buffer=0）")
+    expired_list = db.get_expired_discrete_sheets(today_str)
+    logging.info(f"[buffer] 步骤2：待删除过期表共 {len(expired_list)} 张")
+
+    delete_success = []
+    delete_failed = []
+    if expired_list:
+        with httpx.Client(timeout=30) as client:
+            token = api_wework.get_access_token(client, corp_id, secret)
+            delete_success, delete_failed = _delete_expired_sheets_remote(
+                client, token, doc_id, expired_list
+            )
+
+        # 同步 DB：删除成功的那些
+        for item in delete_success:
+            db.delete_sheet_by_id(item["sheet_id"])
+
+        # 删除日志
+        for item in delete_success:
+            db.insert_log(
+                operator_id=user_id,
+                target_id=0,
+                operation_type="buffer_delete_expired",
+                target_type="sheet",
+                detail={
+                    "sheet_name": item["sheet_name"],
+                    "sheet_id": item["sheet_id"],
+                    "sheet_date": item["sheet_date"],
+                    "reason": "过期离散工作表（日期<今天且is_buffer=0）",
+                },
+            )
+        for item in delete_failed:
+            db.insert_log(
+                operator_id=user_id,
+                target_id=0,
+                operation_type="buffer_delete_expired",
+                target_type="sheet",
+                detail={"sheet_name": item.get("sheet_name"), "sheet_id": item.get("sheet_id")},
+                error_msg=item.get("error", "unknown"),
+            )
+
+    logging.info(f"[buffer] 步骤2完成：删除成功 {len(delete_success)} 张，失败 {len(delete_failed)} 张")
+
+    step2_result = {
+        "expired_count": len(expired_list),
+        "delete_success_count": len(delete_success),
+        "delete_failed_count": len(delete_failed),
+        "delete_success": [{"sheet_name": s["sheet_name"], "sheet_date": s["sheet_date"]} for s in delete_success],
+        "delete_failed": delete_failed,
+    }
+
+    # ------------ 步骤 3：补足 buffer 上新工作表（之前检查 255 限额）------------
+    # 先统计当前总表数
+    current_total = db.count_sheets_and_templates()
+    logging.info(f"[buffer] 步骤3：当前总表数（sheets+templates）= {current_total}，限额 {MAX_SHEETS_LIMIT}")
+
+    supplement_result = {}
+    if current_total >= MAX_SHEETS_LIMIT:
+        logging.warning(f"[buffer] 步骤3跳过：当前总表数 {current_total} 已达/超过限额 {MAX_SHEETS_LIMIT}")
+        supplement_result = {
+            "created_count": 0,
+            "skipped_count": 0,
+            "created": [],
+            "skipped_due_to_limit": [],
+            "note": f"总表数 {current_total} 已达 {MAX_SHEETS_LIMIT}，不补新表",
+            "current_total": current_total,
+        }
+    else:
+        # 临时修改 global 常量（不推荐，改为传参数）——改用直接在函数内接受 months
+        # _supplement_new_sheets 内部会重新算 buffer_end，为一致我们先更新全局缓存
+        old_cache = BULK_SHEETS_MONTHS_CACHE
+        set_bulk_months_cache(months)
+
+        with httpx.Client(timeout=30) as client:
+            token = api_wework.get_access_token(client, corp_id, secret)
+            supplement_result = _supplement_new_sheets(
+                client=client,
+                token=token,
+                doc_id=doc_id,
+                template=template,
+                template_id=template_id,
+                today=today,
+                sessions=sessions,
+                current_total=current_total,
+                operator_userid=operator_userid,
+                operator_name=operator_name,
+            )
+            # 重新统计总表数
+            supplement_result["current_total_after"] = db.count_sheets_and_templates()
+
+        # 恢复缓存
+        set_bulk_months_cache(old_cache)
+
+        # 补表日志
+        for item in supplement_result["created"]:
+            db.insert_log(
+                operator_id=user_id,
+                target_id=0,
+                operation_type="buffer_supplement",
+                target_type="sheet",
+                detail={
+                    "sheet_name": item["sheet_name"],
+                    "sheet_id": item["sheet_id"],
+                    "sheet_date": item["sheet_date"],
+                    "session_type": item["session_type"],
+                },
+            )
+
+    logging.info(f"[buffer] 步骤3完成：补表成功 {supplement_result.get('created_count', 0)} 张，"
+                 f"因限额跳过 {supplement_result.get('skipped_count', 0)} 张")
+
+    # ------------ 汇总日志 ------------
+    final_total = db.count_sheets_and_templates()
+    db.insert_log(
+        operator_id=user_id,
+        target_id=0,
+        operation_type="buffer_manage_daily",
+        target_type="sheet",
+        detail={
+            "virtual_today": today_str,
+            "time_offset_days": get_time_offset_days(),
+            "buffer_range": {"start": buffer_start_str, "end": buffer_end_str},
+            "step1_updated_rows": updated_count,
+            "step2_expired_count": len(expired_list),
+            "step2_deleted": len(delete_success),
+            "step2_delete_failed": len(delete_failed),
+            "step3_created": supplement_result.get("created_count", 0),
+            "step3_skipped_limit": supplement_result.get("skipped_count", 0),
+            "total_before": current_total,
+            "total_after": final_total,
+        },
+    )
+
+    logging.info(f"[buffer] ==== buffer 管理执行完毕 ====")
+    logging.info(f"[buffer] 总表数变化：{current_total} → {final_total}")
+
+    return {
+        "virtual_today": today_str,
+        "time_offset_days": get_time_offset_days(),
+        "step1_update_buffer_flags": step1_result,
+        "step2_delete_expired": step2_result,
+        "step3_supplement_new": supplement_result,
+        "total_sheets_before": current_total,
+        "total_sheets_after": final_total,
+        "max_limit": MAX_SHEETS_LIMIT,
     }

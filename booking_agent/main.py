@@ -2,16 +2,63 @@ import sys
 import os
 import logging
 import json
+from datetime import date, datetime, timedelta, timezone
 from fastapi import FastAPI, Request
 import uvicorn
+
+# ================= 可选依赖兜底：APScheduler + pytz =================
+# 若未安装，只禁用"每日零点定时任务"，其余接口不受影响（避免启动即崩溃）
+try:
+    from apscheduler.schedulers.background import BackgroundScheduler
+    from apscheduler.triggers.cron import CronTrigger
+    _HAS_SCHEDULER = True
+except ImportError:
+    BackgroundScheduler = None  # type: ignore
+    CronTrigger = None          # type: ignore
+    _HAS_SCHEDULER = False
+
+try:
+    import pytz as _pytz
+    _HAS_PYTZ = True
+except ImportError:
+    _pytz = None  # type: ignore
+    _HAS_PYTZ = False
+# =====================================================================
 
 # 添加当前目录到path以便导入模块
 sys.path.append(os.path.dirname(__file__))
 
 from db import init_db
-from composite import create_smart_sheet_and_sync, create_template_sheet_and_sync, create_bulk_sheets_and_sync, create_any_sheet_and_sync, delete_sheet_and_sync, update_record_and_sync, add_record_and_sync, delete_record_and_sync, query_records_and_sync, SEAT_DATA
+from composite import (
+    create_smart_sheet_and_sync,
+    create_template_sheet_and_sync,
+    create_bulk_sheets_and_sync,
+    create_any_sheet_and_sync,
+    delete_sheet_and_sync,
+    update_record_and_sync,
+    add_record_and_sync,
+    delete_record_and_sync,
+    query_records_and_sync,
+    SEAT_DATA,
+    # buffer 管理相关
+    buffer_manage_and_sync,
+    set_time_offset_days,
+    clear_time_offset_days,
+    get_time_offset_days,
+    get_virtual_today,
+    get_virtual_now,
+    set_bulk_months_cache,
+    MAX_SHEETS_LIMIT,
+    BUFFER_DAYS_PAST,
+)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# 可选依赖缺失时打印 WARN（不抛错，继续启动）
+if not _HAS_SCHEDULER:
+    logging.warning("[可选依赖] 未安装 APScheduler：每日零点定时任务已禁用，可手动调用 /test/trigger_buffer 触发")
+if not _HAS_PYTZ:
+    logging.warning("[可选依赖] 未安装 pytz：将使用 UTC+8 固定偏移作为北京时间兜底（建议安装 pytz 以处理夏令时等边界）")
 
 # ================= 可调参数 =================
 CORP_ID = "ww742ff47a509b856e"
@@ -20,12 +67,97 @@ DEFAULT_ADMIN_USERS = ["ChenDaHong"]  # 可指定初始管理员 userid 列表
 BULK_SHEETS_MONTHS = 1  # 批量新建工作表时，默认创建未来几个月
 SESSIONS = [("lunch", "午市"), ("dinner", "晚市")]  # 一天的市场配置：(session_type, 显示名)，按顺序创建
 BULK_SHEETS_MAX_WORKERS = 5  # 批量创建工作表阶段二并发填充的并发数
+
+# ---- buffer 自动管理参数 ----
+BUFFER_SCHEDULE_HOUR = 0    # 每日执行小时（北京时间，默认 0 = 零点）
+BUFFER_SCHEDULE_MINUTE = 0  # 每日执行分钟（默认 0 分）
+BUFFER_MONTHS = BULK_SHEETS_MONTHS  # buffer 未来几个月，默认与批量创建保持一致
+BUFFER_PAST_DAYS = BUFFER_DAYS_PAST  # buffer 过去几天（不含今天）
 # ===========================================
 
 app = FastAPI()
 
 # 初始化数据库
 init_db()
+
+# 同步 BULK_SHEETS_MONTHS 到 composite 缓存
+set_bulk_months_cache(BULK_SHEETS_MONTHS)
+logging.info(f"[启动] buffer 参数：未来 {BUFFER_MONTHS} 个月，过去 {BUFFER_PAST_DAYS} 天，"
+             f"每日 {BUFFER_SCHEDULE_HOUR:02d}:{BUFFER_SCHEDULE_MINUTE:02d} 北京时间执行")
+
+
+# ================= APScheduler 定时任务 =================
+def _buffer_job_wrapper():
+    """定时任务包装器：捕获异常避免 scheduler 崩溃"""
+    try:
+        logging.info("[定时任务] ==== 触发每日零点 buffer 管理 ====")
+        result = buffer_manage_and_sync(
+            corp_id=CORP_ID,
+            secret=SECRET,
+            operator_userid="scheduler",
+            operator_name="定时任务",
+            months=BUFFER_MONTHS,
+            sessions=SESSIONS,
+            past_days=BUFFER_PAST_DAYS,
+        )
+        logging.info(f"[定时任务] buffer 管理完成：总表数 "
+                     f"{result['total_sheets_before']} → {result['total_sheets_after']}")
+    except Exception as e:
+        logging.error(f"[定时任务] buffer 管理执行失败：{e}", exc_info=True)
+
+
+def _get_beijing_tz():
+    """获取北京时区：优先 pytz（精确处理夏令时/历史时区），缺失则用 UTC+8 固定偏移兜底"""
+    if _HAS_PYTZ:
+        return _pytz.timezone("Asia/Shanghai")
+    # 兜底：北京时间 = UTC+8 固定偏移
+    return timezone(timedelta(hours=8), name="Asia/Shanghai(UTC+8)")
+
+
+def _start_scheduler():
+    """启动 APScheduler，每日北京时间零点执行 buffer_manage_and_sync
+    可选依赖兜底：未安装 APScheduler 时直接跳过（不抛错，返回 None）
+    """
+    if not _HAS_SCHEDULER:
+        logging.warning("[定时任务] APScheduler 未安装，跳过启动；请通过 /test/trigger_buffer 手动触发 buffer 管理")
+        return None
+    try:
+        tz = _get_beijing_tz()
+        scheduler = BackgroundScheduler(timezone=tz)
+
+        trigger = CronTrigger(
+            hour=BUFFER_SCHEDULE_HOUR,
+            minute=BUFFER_SCHEDULE_MINUTE,
+            second=0,
+            timezone=tz,
+        )
+        scheduler.add_job(
+            _buffer_job_wrapper,
+            trigger=trigger,
+            id="daily_buffer_manage",
+            name="每日零点 buffer 自动管理",
+            replace_existing=True,
+        )
+        scheduler.start()
+
+        now = datetime.now(tz)
+        next_run = now.replace(
+            hour=BUFFER_SCHEDULE_HOUR,
+            minute=BUFFER_SCHEDULE_MINUTE,
+            second=0,
+            microsecond=0,
+        )
+        if next_run <= now:
+            next_run += timedelta(days=1)
+        logging.info(f"[定时任务] APScheduler 启动成功，下次执行时间（北京时间）：{next_run.isoformat()}")
+        return scheduler
+    except Exception as e:
+        logging.error(f"[定时任务] APScheduler 启动失败：{e}", exc_info=True)
+        return None
+
+
+scheduler = _start_scheduler()
+app.state.scheduler = scheduler
 
 @app.post("/create_doc")
 async def tool_create_doc(request: Request):
@@ -486,6 +618,194 @@ async def tool_query_records(request: Request):
 @app.get("/health")
 async def health_check():
     return {"status": "ok"}
+
+
+# ============================================================
+# 测试接口：时间偏移 + 手动触发 buffer
+# ============================================================
+
+@app.post("/test/set_time_offset")
+async def test_set_time_offset(request: Request):
+    """测试接口：设置时间偏移（天数），模拟日期跳转
+    正数 = 跳到未来 N 天，负数 = 回到过去 N 天，0 = 不偏移
+
+    请求 Body 示例：
+      {"offset_days": 30}   → 虚拟今天 = 真实今天 + 30 天
+      {"offset_days": -7}   → 虚拟今天 = 真实今天 - 7 天
+    """
+    try:
+        body = await request.json()
+        offset_days = body.get("offset_days")
+        if offset_days is None:
+            return {"content": "❌ 参数错误：请提供 offset_days（整数天数）"}
+        try:
+            offset_days = int(offset_days)
+        except (ValueError, TypeError):
+            return {"content": "❌ 参数错误：offset_days 必须是整数"}
+
+        set_time_offset_days(offset_days)
+        virtual_today = get_virtual_today()
+        real_today = date.today()
+        msg = (
+            f"✅ 设置时间偏移成功\n"
+            f"⏱️ 偏移量：{offset_days:+d} 天\n"
+            f"📅 真实今天：{real_today.isoformat()}\n"
+            f"📅 虚拟今天：{virtual_today.isoformat()}\n"
+            f"(后续所有日期计算均使用虚拟今天，包括 /test/trigger_buffer)"
+        )
+        return {
+            "content": msg,
+            "offset_days": offset_days,
+            "real_today": real_today.isoformat(),
+            "virtual_today": virtual_today.isoformat(),
+        }
+    except Exception as e:
+        logging.error(f"设置时间偏移失败: {e}")
+        return {"content": f"❌ 操作失败: {str(e)}"}
+
+
+@app.post("/test/clear_time_offset")
+async def test_clear_time_offset():
+    """测试接口：清除时间偏移，恢复真实时间"""
+    try:
+        clear_time_offset_days()
+        virtual_today = get_virtual_today()
+        real_today = date.today()
+        msg = (
+            f"✅ 已清除时间偏移\n"
+            f"📅 真实今天：{real_today.isoformat()}\n"
+            f"📅 虚拟今天：{virtual_today.isoformat()}（现在与真实时间一致）"
+        )
+        return {
+            "content": msg,
+            "offset_days": 0,
+            "real_today": real_today.isoformat(),
+            "virtual_today": virtual_today.isoformat(),
+        }
+    except Exception as e:
+        logging.error(f"清除时间偏移失败: {e}")
+        return {"content": f"❌ 操作失败: {str(e)}"}
+
+
+@app.get("/test/get_current_time")
+async def test_get_current_time():
+    """测试接口：获取当前时间信息（真实时间 + 虚拟时间 + 偏移量）"""
+    real_now = datetime.now()
+    virtual_now = get_virtual_now()
+    offset = get_time_offset_days()
+    real_today = real_now.date()
+    virtual_today = virtual_now.date()
+
+    # scheduler 下次执行时间
+    next_run_info = None
+    sched = app.state.scheduler
+    if sched:
+        try:
+            jobs = sched.get_jobs()
+            if jobs:
+                job = jobs[0]
+                if job.next_run_time:
+                    next_run_info = job.next_run_time.isoformat()
+        except Exception:
+            pass
+
+    return {
+        "content": (
+            f"⏱️ 时间偏移量：{offset:+d} 天\n"
+            f"🕒 真实当前时间：{real_now.strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"📅 真实今天：{real_today.isoformat()}\n"
+            f"🕒 虚拟当前时间：{virtual_now.strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"📅 虚拟今天：{virtual_today.isoformat()}\n"
+            f"🔔 定时任务下次执行（北京时间）：{next_run_info or '调度器未启动'}"
+        ),
+        "offset_days": offset,
+        "real_now": real_now.isoformat(timespec="seconds"),
+        "real_today": real_today.isoformat(),
+        "virtual_now": virtual_now.isoformat(timespec="seconds"),
+        "virtual_today": virtual_today.isoformat(),
+        "scheduler_next_run": next_run_info,
+    }
+
+
+@app.post("/test/trigger_buffer")
+async def test_trigger_buffer(request: Request):
+    """测试接口：手动触发 buffer 管理主流程（立即执行，不等零点）
+    执行顺序：1.更新buffer范围 → 2.删除过期离散表 → 3.补新表（255限额检查）
+
+    可选参数（覆盖默认值，便于测试）：
+      - months:    buffer 未来几个月（默认用 BUFFER_MONTHS）
+      - past_days: buffer 过去几天（默认用 BUFFER_PAST_DAYS）
+
+    请求 Body 示例：
+      {}                                → 使用默认参数执行
+      {"months": 2, "past_days": 3}    → 自定义 buffer 范围
+    """
+    try:
+        body = await request.json() or {}
+        months = body.get("months", BUFFER_MONTHS)
+        past_days = body.get("past_days", BUFFER_PAST_DAYS)
+        operator_userid = body.get("operator_userid", "test_trigger")
+        operator_name = body.get("operator_name", "测试手动触发")
+
+        logging.info(f"[测试触发] 手动触发 buffer 管理：months={months}, past_days={past_days}")
+        result = buffer_manage_and_sync(
+            corp_id=CORP_ID,
+            secret=SECRET,
+            operator_userid=operator_userid,
+            operator_name=operator_name,
+            months=months,
+            sessions=SESSIONS,
+            past_days=past_days,
+        )
+
+        # 构造友好的汇总消息
+        s1 = result["step1_update_buffer_flags"]
+        s2 = result["step2_delete_expired"]
+        s3 = result["step3_supplement_new"]
+
+        msg_lines = [
+            f"✅ buffer 管理执行完成",
+            f"📅 虚拟今天：{result['virtual_today']}（偏移 {result['time_offset_days']:+d} 天）",
+            f"🎯 buffer 范围：[{s1['buffer_start']}, {s1['buffer_end']}]",
+            "",
+            f"--- 步骤1：更新 buffer 标记 ---",
+            f"  影响行数：{s1['updated_rows']} 行",
+            "",
+            f"--- 步骤2：删除过期离散工作表（日期<今天 且 is_buffer=0）---",
+            f"  查找到过期表：{s2['expired_count']} 张",
+            f"  删除成功：{s2['delete_success_count']} 张",
+            f"  删除失败：{s2['delete_failed_count']} 张",
+        ]
+        if s2["delete_success"]:
+            names = "、".join(s["sheet_name"] for s in s2["delete_success"][:5])
+            msg_lines.append(f"  删除成功（前5张）：{names}")
+        if s2["delete_failed"]:
+            fail_names = "、".join(s.get("sheet_name", "?") for s in s2["delete_failed"][:5])
+            msg_lines.append(f"  删除失败（前5张）：{fail_names}")
+
+        msg_lines += [
+            "",
+            f"--- 步骤3：补足 buffer 新工作表（限额 {result['max_limit']} 张）---",
+            f"  执行前总表数：{result['total_sheets_before']} 张",
+            f"  补表成功：{s3.get('created_count', 0)} 张",
+            f"  因限额跳过：{s3.get('skipped_count', 0)} 张",
+            f"  执行后总表数：{result['total_sheets_after']} 张",
+        ]
+        if s3.get("created"):
+            names = "、".join(s["sheet_name"] for s in s3["created"][:5])
+            msg_lines.append(f"  补表成功（前5张）：{names}")
+        if s3.get("skipped_due_to_limit"):
+            names = "、".join(s["sheet_name"] for s in s3["skipped_due_to_limit"][:5])
+            msg_lines.append(f"  因限额跳过（前5张）：{names}")
+
+        return {
+            "content": "\n".join(msg_lines),
+            **result,
+        }
+    except Exception as e:
+        logging.error(f"手动触发 buffer 管理失败: {e}", exc_info=True)
+        return {"content": f"❌ 操作失败: {str(e)}"}
+
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)

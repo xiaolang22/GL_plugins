@@ -323,3 +323,72 @@ def is_template_sheet(sheet_id: str) -> bool:
     exists = cursor.fetchone() is not None
     conn.close()
     return exists
+
+
+# ==================== buffer 自动管理相关 ====================
+
+def update_buffer_flags(buffer_start: str, buffer_end: str) -> int:
+    """
+    根据 buffer 时间范围批量更新 is_buffer 字段：
+    - sheet_date 在 [buffer_start, buffer_end] 之间 → is_buffer=1
+    - 不在范围内 → is_buffer=0
+    返回被更新的行数
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        'UPDATE sheets SET is_buffer = 1 WHERE sheet_date BETWEEN ? AND ?',
+        (buffer_start, buffer_end)
+    )
+    marked = cursor.rowcount
+    cursor.execute(
+        'UPDATE sheets SET is_buffer = 0 WHERE sheet_date NOT BETWEEN ? AND ?',
+        (buffer_start, buffer_end)
+    )
+    unmarked = cursor.rowcount
+    conn.commit()
+    conn.close()
+    return marked + unmarked
+
+
+def get_expired_discrete_sheets(cutoff_date: str) -> list:
+    """
+    获取需要删除的过期离散工作表列表：
+    - sheet_date < cutoff_date（严格小于今天）
+    - AND is_buffer = 0
+    返回 [dict(sheet_id, sheet_name, sheet_date)]
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        'SELECT sheet_id, sheet_name, sheet_date FROM sheets WHERE sheet_date < ? AND is_buffer = 0',
+        (cutoff_date,)
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_buffer_max_date() -> str:
+    """
+    获取数据库中 buffer 实际上界（is_buffer=1 的记录中最大的 sheet_date）。
+    如果没有 buffer 记录，返回 None。
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT MAX(sheet_date) AS md FROM sheets WHERE is_buffer = 1")
+    row = cursor.fetchone()
+    conn.close()
+    return row["md"] if row else None
+
+
+def count_sheets_and_templates() -> int:
+    """统计智能表格中已有的总子表数：sheets记录数 + templates记录数（用于255限额检查）"""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*) FROM sheets")
+    s = cursor.fetchone()[0]
+    cursor.execute("SELECT COUNT(*) FROM templates")
+    t = cursor.fetchone()[0]
+    conn.close()
+    return s + t
