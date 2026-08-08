@@ -194,3 +194,22 @@ def get_sheet_list(client: httpx.Client, access_token: str, docid: str, offset: 
     if result.get("errcode") != 0:
         raise Exception(f"查询子表列表失败: {result}")
     return result  # 含 sheet_list: [{sheet_id, title, ...}]
+
+
+def update_records(client: httpx.Client, access_token: str, docid: str, sheet_id: str, records: List[Dict]) -> Dict[str, Any]:
+    """更新记录（按 record_id 更新指定字段的值）
+
+    records 格式:
+        [{"record_id": "xxx", "values": {"字段名": [{"type":"text","text":"值"}]}}]
+    """
+    url = f"https://qyapi.weixin.qq.com/cgi-bin/wedoc/smartsheet/update_records?access_token={access_token}"
+    payload = {
+        "docid": docid,
+        "sheet_id": sheet_id,
+        "records": records,
+    }
+    resp = client.post(url, json=payload)
+    result = resp.json()
+    if result.get("errcode") != 0:
+        raise Exception(f"更新记录失败: {result}")
+    return result

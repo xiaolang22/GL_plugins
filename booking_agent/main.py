@@ -9,7 +9,7 @@ import uvicorn
 sys.path.append(os.path.dirname(__file__))
 
 from db import init_db
-from composite import create_smart_sheet_and_sync, create_template_sheet_and_sync, create_bulk_sheets_and_sync, create_any_sheet_and_sync, delete_sheet_and_sync, SEAT_DATA
+from composite import create_smart_sheet_and_sync, create_template_sheet_and_sync, create_bulk_sheets_and_sync, create_any_sheet_and_sync, delete_sheet_and_sync, update_record_and_sync, SEAT_DATA
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -227,6 +227,84 @@ async def tool_delete_sheet(request: Request):
         }
     except Exception as e:
         logging.error(f"删除工作表失败: {e}")
+        return {"content": f"❌ 操作失败: {str(e)}"}
+
+@app.post("/update_record")
+async def tool_update_record(request: Request):
+    """工具6：更新指定工作表中指定座位记录的字段值（订座信息）
+
+    自动应用订座规则：
+      - 客人称呼/客人电话/人数/留菜/留位人 任一非空 → "是否已订"自动设为"已订座"
+      - 全部为空 → "是否已订"自动设为"未订座"
+      （判断基于更新后的最终值，即当前值 + 更新值合并后）
+
+    请求 Body（JSON）示例：
+      - 订座（填入客人信息）：
+        {"date": "2026-09-26", "session": "dinner", "seat_name": "北京房",
+         "fields": {"客人称呼": "张三", "客人电话": "13800138000", "人数": "8"},
+         "operator_userid": "xxx", "operator_name": "yyy"}
+
+      - 取消订座（清空客人信息）：
+        {"date": "2026-09-26", "session": "dinner", "seat_name": "北京房",
+         "fields": {"客人称呼": "", "客人电话": "", "人数": "", "留菜": "", "留位人": ""},
+         "operator_userid": "xxx", "operator_name": "yyy"}
+
+    参数说明：
+      - date:    日期（YYYY-MM-DD / MM-DD）
+      - session: 场次（lunch/dinner/午市/晚市）
+      - seat_name: 座位名称（如"北京房"）
+      - fields:  要更新的字段字典，支持任意字段名
+    """
+    try:
+        body = await request.json()
+        sheet_date = body.get("date")
+        session = body.get("session")
+        seat_name = body.get("seat_name")
+        fields = body.get("fields", {})
+        operator_userid = body.get("operator_userid", "system")
+        operator_name = body.get("operator_name", "系统")
+
+        if not sheet_date:
+            return {"content": "❌ 参数错误：请提供 date"}
+        if not session:
+            return {"content": "❌ 参数错误：请提供 session（lunch/dinner/午市/晚市）"}
+        if not seat_name:
+            return {"content": "❌ 参数错误：请提供 seat_name"}
+        if not fields:
+            return {"content": "❌ 参数错误：请提供 fields（要更新的字段）"}
+
+        result = update_record_and_sync(
+            CORP_ID, SECRET, operator_userid, operator_name,
+            sheet_date=sheet_date,
+            session=session,
+            seat_name=seat_name,
+            fields=fields,
+            default_sessions=SESSIONS,
+        )
+
+        updated_lines = []
+        for k, v in result["updated_fields"].items():
+            updated_lines.append(f"  · {k}：{v}")
+
+        msg = (
+            f"✅ 成功更新订座信息\n"
+            f"📅 工作表：{result['sheet_name']}\n"
+            f"🪑 座位：{result['seat_name']}\n"
+            f"📝 更新字段：\n"
+            + "\n".join(updated_lines)
+            + f"\n🔔 订座状态：{result['booking_status']}"
+        )
+
+        return {
+            "content": msg,
+            "sheet_name": result["sheet_name"],
+            "seat_name": result["seat_name"],
+            "record_id": result["record_id"],
+            "updated_fields": result["updated_fields"],
+            "booking_status": result["booking_status"],
+        }
+    except Exception as e:
+        logging.error(f"更新记录失败: {e}")
         return {"content": f"❌ 操作失败: {str(e)}"}
 
 @app.get("/health")

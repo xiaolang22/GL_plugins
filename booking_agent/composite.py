@@ -935,3 +935,204 @@ def delete_sheet_and_sync(
         "doc_id": doc_id,
         "deleted_at": deleted_at,
     }
+
+
+# ============================================================
+# 工具6：更新记录内容（订座信息）
+# ============================================================
+
+# 订座相关字段：这些字段中任一非空 → "是否已订"自动设为"已订座"
+BOOKING_RELATED_FIELDS = ["客人称呼", "客人电话", "人数", "留菜", "留位人"]
+
+
+def _extract_text_value(field_values: list) -> str:
+    """从记录的某个字段值列表中提取纯文本值
+
+    支持两种格式：
+    - 文本字段: [{"type": "text", "text": "值"}]
+    - 单选字段: [{"text": "选项"}]
+    """
+    if not field_values:
+        return ""
+    for item in field_values:
+        if isinstance(item, dict):
+            text = item.get("text", "")
+            if text:
+                return text
+    return ""
+
+
+def _build_update_value(field_type: str, value) -> list:
+    """构造单个字段值的 API 封装格式
+
+    - 单选字段: [{"text": str(value)}]
+    - 其他字段（文本等）: [{"type": "text", "text": str(value)}]
+    """
+    if field_type == "FIELD_TYPE_SINGLE_SELECT":
+        return [{"text": str(value)}]
+    else:
+        return [{"type": "text", "text": str(value)}]
+
+
+def update_record_and_sync(
+    corp_id: str,
+    secret: str,
+    operator_userid: str,
+    operator_name: str,
+    sheet_date: str,
+    session: str,
+    seat_name: str,
+    fields: Dict[str, Any],
+    default_sessions: List[Tuple[str, str]] = None,
+) -> Dict[str, Any]:
+    """更新指定工作表中指定座位记录的字段值
+
+    参数:
+        corp_id, secret: 企业微信凭证
+        operator_userid, operator_name: 操作人
+        sheet_date: 目标日期（YYYY-MM-DD / MM-DD）
+        session: 场次（lunch/dinner/午市/晚市）
+        seat_name: 座位名称（如"北京房"）
+        fields: 要更新的字段字典，如 {"客人称呼": "张三", "客人电话": "13800138000"}
+        default_sessions: 场次默认配置
+
+    订座规则:
+        - BOOKING_RELATED_FIELDS 中任一字段非空 → "是否已订" = "已订座"
+        - 全部为空 → "是否已订" = "未订座"
+        （判断基于更新后的最终值，即当前值 + 更新值合并后）
+
+    返回: {
+        "sheet_name": str,
+        "sheet_id": str,
+        "seat_name": str,
+        "record_id": str,
+        "updated_fields": dict,   # 实际更新的字段和值
+        "booking_status": str,    # "已订座" / "未订座"
+    }
+    """
+    if default_sessions is None:
+        default_sessions = [("lunch", "午市"), ("dinner", "晚市")]
+
+    if not fields:
+        raise ValueError("请至少提供一个要更新的字段")
+    if not seat_name:
+        raise ValueError("请提供座位名称 seat_name")
+
+    # ---------- 步骤 0：解析参数，定位工作表 ----------
+    target_date = _parse_date_str(sheet_date)
+    normalized = _normalize_sessions(session, default_sessions)
+    session_type, session_label = normalized[0]
+    sheet_name = _make_sheet_name(target_date, session_label)
+
+    # 从数据库查 sheet_id
+    sheet_row = db.get_sheet_by_name(sheet_name)
+    if not sheet_row:
+        raise ValueError(
+            f"工作表不存在：{sheet_name}（日期={target_date.isoformat()}, 场次={session_label}）"
+        )
+    sheet_id = sheet_row["sheet_id"]
+    doc_id = sheet_row["doc_id"]
+
+    # ---------- 步骤 1：获取 token + 字段列表 + 记录 ----------
+    with httpx.Client(timeout=30) as client:
+        token = api_wework.get_access_token(client, corp_id, secret)
+
+        # 获取字段列表，建立 field_title → {field_id, field_type} 映射
+        fields_resp = api_wework.get_fields(client, token, doc_id, sheet_id)
+        field_map = {}
+        for f in fields_resp.get("fields", []):
+            field_map[f["field_title"]] = {
+                "field_id": f["field_id"],
+                "field_type": f.get("field_type", "FIELD_TYPE_TEXT"),
+            }
+        if not field_map:
+            raise Exception(f"工作表 {sheet_name} 没有任何字段")
+
+        # 查询记录，定位目标座位
+        records_resp = api_wework.get_records(client, token, doc_id, sheet_id, limit=100)
+        all_records = records_resp.get("records", [])
+        total = records_resp.get("total", len(all_records))
+
+        # 防御性分页（座位一般47条，一次够）
+        next_offset = records_resp.get("next_offset")
+        while next_offset and next_offset < total:
+            more_resp = api_wework.get_records(client, token, doc_id, sheet_id, offset=next_offset, limit=100)
+            all_records.extend(more_resp.get("records", []))
+            next_offset = more_resp.get("next_offset")
+
+        # 找到座位名称匹配的记录
+        target_record = None
+        for rec in all_records:
+            values = rec.get("values", {})
+            seat_val = _extract_text_value(values.get("座位名称", []))
+            if seat_val == seat_name:
+                target_record = rec
+                break
+
+        if not target_record:
+            raise ValueError(f"在工作表 {sheet_name} 中未找到座位：{seat_name}")
+
+        record_id = target_record["record_id"]
+        current_values = target_record.get("values", {})
+
+        # ---------- 步骤 2：应用订座规则 ----------
+        # 合并当前值和更新值（用于判断订座状态）
+        merged_booking_values = {}
+        for field_title in BOOKING_RELATED_FIELDS:
+            current_val = _extract_text_value(current_values.get(field_title, []))
+            if field_title in fields:
+                merged_booking_values[field_title] = str(fields[field_title]) if fields[field_title] else ""
+            else:
+                merged_booking_values[field_title] = current_val
+
+        any_non_empty = any(v for v in merged_booking_values.values())
+        booking_status = "已订座" if any_non_empty else "未订座"
+
+        # 构造最终的更新字段（包含自动计算的"是否已订"）
+        final_fields = dict(fields)
+        final_fields["是否已订"] = booking_status  # 自动覆盖
+
+        # ---------- 步骤 3：构造 payload 并更新 ----------
+        # 校验字段名是否存在
+        unknown_fields = [f for f in final_fields if f not in field_map]
+        if unknown_fields:
+            raise ValueError(f"以下字段不存在于工作表中：{unknown_fields}")
+
+        update_values = {}
+        for field_title, value in final_fields.items():
+            field_type = field_map[field_title]["field_type"]
+            update_values[field_title] = _build_update_value(field_type, value)
+
+        api_wework.update_records(
+            client, token, doc_id, sheet_id,
+            [{"record_id": record_id, "values": update_values}]
+        )
+
+    # ---------- 步骤 4：操作日志 ----------
+    user_id = db.insert_user(operator_userid, operator_name)
+    detail = {
+        "sheet_name": sheet_name,
+        "sheet_id": sheet_id,
+        "seat_name": seat_name,
+        "record_id": record_id,
+        "updated_fields": final_fields,
+        "booking_status": booking_status,
+        "operator": {"userid": operator_userid, "name": operator_name},
+    }
+    db.insert_log(
+        operator_id=user_id,
+        target_id=sheet_row["id"],
+        operation_type="update_record",
+        target_type="sheet",
+        detail=detail,
+    )
+
+    logging.info(f"更新记录成功：{sheet_name} / {seat_name} → {final_fields}")
+    return {
+        "sheet_name": sheet_name,
+        "sheet_id": sheet_id,
+        "seat_name": seat_name,
+        "record_id": record_id,
+        "updated_fields": final_fields,
+        "booking_status": booking_status,
+    }
