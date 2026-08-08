@@ -1401,3 +1401,130 @@ def delete_record_and_sync(
         "seat_name": target_seat_name,
         "deleted_at": deleted_at,
     }
+
+
+# ============================================================
+# 工具9：查询工作表记录（返回格式化文本，供大模型理解）
+# ============================================================
+# 字段顺序（与模板一致）
+RECORD_FIELD_ORDER = [
+    "座位名称", "座位容量", "座位备注", "客人称呼", "客人电话",
+    "人数", "留菜", "留位人", "座位类型", "是否已订",
+]
+
+# 表头精简名（紧凑显示）
+RECORD_FIELD_SHORT = {
+    "座位名称": "座位名称",
+    "座位容量": "容量",
+    "座位备注": "备注",
+    "客人称呼": "称呼",
+    "客人电话": "电话",
+    "人数": "人数",
+    "留菜": "留菜",
+    "留位人": "留位人",
+    "座位类型": "类型",
+    "是否已订": "是否已订",
+}
+
+
+def query_records_and_sync(
+    corp_id: str,
+    secret: str,
+    sheet_date: str,
+    session: str,
+    default_sessions: List[Tuple[str, str]] = None,
+) -> Dict[str, Any]:
+    """查询指定工作表的所有记录，返回格式化文本
+
+    参数:
+        sheet_date: 日期（支持 YYYY-MM-DD / MM-DD 等）
+        session:    场次（lunch/dinner/午市/晚市）
+
+    返回: {
+        "sheet_name": str,
+        "content": str,       # 格式化 Markdown 文本（直接给大模型）
+        "total": int,
+        "booked_count": int,
+        "available_count": int,
+    }
+    """
+    if default_sessions is None:
+        default_sessions = [("lunch", "午市"), ("dinner", "晚市")]
+
+    # ---------- 步骤 0：解析参数，定位工作表 ----------
+    target_date = _parse_date_str(sheet_date)
+    normalized = _normalize_sessions(session, default_sessions)
+    _session_type, session_label = normalized[0]
+    sheet_name = _make_sheet_name(target_date, session_label)
+
+    sheet_row = db.get_sheet_by_name(sheet_name)
+    if not sheet_row:
+        raise ValueError(
+            f"工作表不存在：{sheet_name}（日期={target_date.isoformat()}, 场次={session_label}）"
+        )
+    sheet_id = sheet_row["sheet_id"]
+    doc_id = sheet_row["doc_id"]
+
+    # ---------- 步骤 1：获取全部记录 ----------
+    with httpx.Client(timeout=30) as client:
+        token = api_wework.get_access_token(client, corp_id, secret)
+        records_resp = api_wework.get_records(client, token, doc_id, sheet_id, limit=100)
+        all_records = records_resp.get("records", [])
+        total = records_resp.get("total", len(all_records))
+
+        # 防御性分页（47 条记录通常一次就够）
+        next_offset = records_resp.get("next_offset")
+        while next_offset and next_offset < total:
+            more_resp = api_wework.get_records(client, token, doc_id, sheet_id, offset=next_offset, limit=100)
+            all_records.extend(more_resp.get("records", []))
+            next_offset = more_resp.get("next_offset")
+
+    # ---------- 步骤 2：提取每条记录的字段值 ----------
+    parsed_rows = []
+    for rec in all_records:
+        values = rec.get("values", {})
+        row = {}
+        for field_title in RECORD_FIELD_ORDER:
+            row[field_title] = _extract_text_value(values.get(field_title, []))
+        parsed_rows.append(row)
+
+    # ---------- 步骤 3：统计摘要 ----------
+    total_count = len(parsed_rows)
+    booked_count = sum(1 for r in parsed_rows if r["是否已订"] == "已订座")
+    available_count = total_count - booked_count
+
+    room_total = sum(1 for r in parsed_rows if r["座位类型"] == "房间")
+    room_booked = sum(1 for r in parsed_rows if r["座位类型"] == "房间" and r["是否已订"] == "已订座")
+    hall_total = sum(1 for r in parsed_rows if r["座位类型"] == "大厅")
+    hall_booked = sum(1 for r in parsed_rows if r["座位类型"] == "大厅" and r["是否已订"] == "已订座")
+
+    # ---------- 步骤 4：构造 Markdown 表格 ----------
+    lines = []
+    lines.append(f"📋 工作表：{sheet_name}")
+    lines.append(f"📊 记录总数：{total_count} 条（已订 {booked_count} 条，未订 {available_count} 条）")
+    lines.append(f"🏠 房间：{room_total} 间（已订 {room_booked} 间）  🍽️ 大厅：{hall_total} 桌（已订 {hall_booked} 桌）")
+    lines.append("")
+
+    # 表头
+    headers = ["序号"] + [RECORD_FIELD_SHORT[f] for f in RECORD_FIELD_ORDER]
+    lines.append("| " + " | ".join(headers) + " |")
+    lines.append("|" + "|".join(["------"] * len(headers)) + "|")
+
+    # 数据行
+    for idx, row in enumerate(parsed_rows, start=1):
+        cells = [str(idx)]
+        for field_title in RECORD_FIELD_ORDER:
+            val = row[field_title]
+            cells.append(val if val else "-")
+        lines.append("| " + " | ".join(cells) + " |")
+
+    content = "\n".join(lines)
+
+    logging.info(f"查询工作表记录：{sheet_name}（共 {total_count} 条）")
+    return {
+        "sheet_name": sheet_name,
+        "content": content,
+        "total": total_count,
+        "booked_count": booked_count,
+        "available_count": available_count,
+    }

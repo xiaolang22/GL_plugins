@@ -9,7 +9,7 @@ import uvicorn
 sys.path.append(os.path.dirname(__file__))
 
 from db import init_db
-from composite import create_smart_sheet_and_sync, create_template_sheet_and_sync, create_bulk_sheets_and_sync, create_any_sheet_and_sync, delete_sheet_and_sync, update_record_and_sync, add_record_and_sync, delete_record_and_sync, SEAT_DATA
+from composite import create_smart_sheet_and_sync, create_template_sheet_and_sync, create_bulk_sheets_and_sync, create_any_sheet_and_sync, delete_sheet_and_sync, update_record_and_sync, add_record_and_sync, delete_record_and_sync, query_records_and_sync, SEAT_DATA
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -441,6 +441,46 @@ async def tool_delete_record(request: Request):
         }
     except Exception as e:
         logging.error(f"删除记录失败: {e}")
+        return {"content": f"❌ 操作失败: {str(e)}"}
+
+@app.post("/query_records")
+async def tool_query_records(request: Request):
+    """工具9：查询工作表所有记录
+
+    返回格式化的 Markdown 表格 + 统计摘要，直接供大模型理解。
+
+    请求 Body（JSON）示例：
+      {"date": "2026-09-26", "session": "dinner"}
+
+    session 支持：lunch / dinner / 午市 / 晚市
+    date 支持：2026-09-26 / 9-26 / 2026/9/26 等格式
+    """
+    try:
+        body = await request.json()
+        sheet_date = body.get("date")
+        session = body.get("session")
+
+        if not sheet_date:
+            return {"content": "❌ 参数错误：请提供 date"}
+        if not session:
+            return {"content": "❌ 参数错误：请提供 session（lunch/dinner/午市/晚市）"}
+
+        result = query_records_and_sync(
+            CORP_ID, SECRET,
+            sheet_date=sheet_date,
+            session=session,
+            default_sessions=SESSIONS,
+        )
+
+        return {
+            "content": result["content"],
+            "sheet_name": result["sheet_name"],
+            "total": result["total"],
+            "booked_count": result["booked_count"],
+            "available_count": result["available_count"],
+        }
+    except Exception as e:
+        logging.error(f"查询工作表记录失败: {e}")
         return {"content": f"❌ 操作失败: {str(e)}"}
 
 @app.get("/health")
