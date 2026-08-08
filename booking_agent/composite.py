@@ -498,7 +498,8 @@ def create_bulk_sheets_and_sync(corp_id: str, secret: str, operator_userid: str,
             session_type=task["session_type"],
             weekday=task["weekday"],
             template_id=template_id,
-            created_by=operator_userid
+            created_by=operator_userid,
+            is_buffer=1,
         )
 
     # 记录失败日志（阶段一失败 + 阶段三重试失败）

@@ -53,6 +53,7 @@ def init_db():
             session_type TEXT NOT NULL CHECK (session_type IN ('lunch', 'dinner')),
             weekday TEXT NOT NULL,
             template_id INTEGER NOT NULL,
+            is_buffer INTEGER DEFAULT 0,
             created_at TIMESTAMP DEFAULT (datetime('now', '+8 hours')),
             created_by TEXT NOT NULL,
             FOREIGN KEY (doc_id) REFERENCES docs(doc_id),
@@ -91,6 +92,22 @@ def init_db():
     if "template_content" not in existing_columns:
         cursor.execute("ALTER TABLE templates ADD COLUMN template_content TEXT")
         logging.info("数据库迁移：templates 表新增 template_content 列")
+
+    # 迁移：为 sheets 表添加 is_buffer 列（标记是否属于 buffer 范围）
+    cursor.execute("PRAGMA table_info(sheets)")
+    existing_sheets_columns = [row[1] for row in cursor.fetchall()]
+    if "is_buffer" not in existing_sheets_columns:
+        cursor.execute("ALTER TABLE sheets ADD COLUMN is_buffer INTEGER DEFAULT 0")
+        logging.info("数据库迁移：sheets 表新增 is_buffer 列")
+        # 迁移已有数据：按当前时间的 buffer 范围标记（今天-7天 ~ 今天+3个月）
+        cursor.execute('''
+            UPDATE sheets
+            SET is_buffer = 1
+            WHERE sheet_date BETWEEN date(datetime('now', '+8 hours'), '-7 days')
+                                 AND date(datetime('now', '+8 hours'), '+3 months')
+        ''')
+        updated = cursor.rowcount
+        logging.info(f"数据库迁移：已将 {updated} 条 sheets 记录标记为 buffer")
 
     conn.commit()
     conn.close()
@@ -189,14 +206,14 @@ def get_first_template():
         return result
     return None
 
-def insert_sheet(doc_id, sheet_id, sheet_name, sheet_date, session_type, weekday, template_id, created_by):
+def insert_sheet(doc_id, sheet_id, sheet_name, sheet_date, session_type, weekday, template_id, created_by, is_buffer: int = 0):
     """插入普通工作表记录"""
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute('''
-        INSERT INTO sheets (doc_id, sheet_id, sheet_name, sheet_date, session_type, weekday, template_id, created_by)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    ''', (doc_id, sheet_id, sheet_name, sheet_date, session_type, weekday, template_id, created_by))
+        INSERT INTO sheets (doc_id, sheet_id, sheet_name, sheet_date, session_type, weekday, template_id, is_buffer, created_by)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ''', (doc_id, sheet_id, sheet_name, sheet_date, session_type, weekday, template_id, is_buffer, created_by))
     conn.commit()
     row_id = cursor.lastrowid
     conn.close()
