@@ -24,7 +24,7 @@ def init_db():
             doc_id TEXT NOT NULL UNIQUE,
             doc_name TEXT NOT NULL,
             doc_url TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            created_at TIMESTAMP DEFAULT (datetime('now', '+8 hours')),
             created_by TEXT NOT NULL
         )
     ''')
@@ -36,7 +36,7 @@ def init_db():
             doc_id TEXT NOT NULL,
             sheet_id TEXT NOT NULL UNIQUE,
             sheet_name TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            created_at TIMESTAMP DEFAULT (datetime('now', '+8 hours')),
             created_by TEXT NOT NULL,
             FOREIGN KEY (doc_id) REFERENCES docs(doc_id)
         )
@@ -53,7 +53,7 @@ def init_db():
             session_type TEXT NOT NULL CHECK (session_type IN ('lunch', 'dinner')),
             weekday TEXT NOT NULL,
             template_id INTEGER NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            created_at TIMESTAMP DEFAULT (datetime('now', '+8 hours')),
             created_by TEXT NOT NULL,
             FOREIGN KEY (doc_id) REFERENCES docs(doc_id),
             FOREIGN KEY (template_id) REFERENCES templates(id)
@@ -66,7 +66,7 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             userid TEXT NOT NULL UNIQUE,
             name TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            created_at TIMESTAMP DEFAULT (datetime('now', '+8 hours'))
         )
     ''')
 
@@ -80,7 +80,7 @@ def init_db():
             target_type TEXT NOT NULL CHECK (target_type IN ('doc', 'sheet', 'template')),
             detail TEXT,
             error_msg TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            created_at TIMESTAMP DEFAULT (datetime('now', '+8 hours')),
             FOREIGN KEY (operator_id) REFERENCES users(id)
         )
     ''')
