@@ -1136,3 +1136,268 @@ def update_record_and_sync(
         "updated_fields": final_fields,
         "booking_status": booking_status,
     }
+
+
+# ============================================================
+# 工具7：添加记录（向指定工作表添加一条新记录）
+# ============================================================
+def add_record_and_sync(
+    corp_id: str,
+    secret: str,
+    operator_userid: str,
+    operator_name: str,
+    sheet_date: str,
+    session: str,
+    seat_name: str,
+    fields: Dict[str, Any] = None,
+    default_sessions: List[Tuple[str, str]] = None,
+) -> Dict[str, Any]:
+    """向指定工作表添加一条新记录
+
+    默认值：
+        - 座位名称 = 传入的 seat_name
+        - 座位类型 = "大厅"
+        - 是否已订 = "未订座"
+        - 其余字段 = 空
+
+    订座规则（与 update_record 一致）：
+        - BOOKING_RELATED_FIELDS 中任一非空 → "是否已订" = "已订座"
+        - 全部为空 → "是否已订" = "未订座"
+
+    参数:
+        seat_name: 新座位的名称（必填）
+        fields:    额外要填写的字段（可选，覆盖默认值）
+
+    返回: {
+        "sheet_name": str,
+        "sheet_id": str,
+        "seat_name": str,
+        "record_id": str,
+        "fields": dict,         # 最终写入的字段
+        "booking_status": str,
+    }
+    """
+    if default_sessions is None:
+        default_sessions = [("lunch", "午市"), ("dinner", "晚市")]
+
+    if not seat_name:
+        raise ValueError("请提供座位名称 seat_name")
+
+    if fields is None:
+        fields = {}
+
+    # ---------- 步骤 0：解析参数，定位工作表 ----------
+    target_date = _parse_date_str(sheet_date)
+    normalized = _normalize_sessions(session, default_sessions)
+    _session_type, session_label = normalized[0]
+    sheet_name = _make_sheet_name(target_date, session_label)
+
+    sheet_row = db.get_sheet_by_name(sheet_name)
+    if not sheet_row:
+        raise ValueError(
+            f"工作表不存在：{sheet_name}（日期={target_date.isoformat()}, 场次={session_label}）"
+        )
+    sheet_id = sheet_row["sheet_id"]
+    doc_id = sheet_row["doc_id"]
+
+    # ---------- 步骤 1：获取字段列表 ----------
+    with httpx.Client(timeout=30) as client:
+        token = api_wework.get_access_token(client, corp_id, secret)
+
+        fields_resp = api_wework.get_fields(client, token, doc_id, sheet_id)
+        field_map = {}
+        for f in fields_resp.get("fields", []):
+            field_map[f["field_title"]] = {
+                "field_id": f["field_id"],
+                "field_type": f.get("field_type", "FIELD_TYPE_TEXT"),
+            }
+        if not field_map:
+            raise Exception(f"工作表 {sheet_name} 没有任何字段")
+
+        # ---------- 步骤 2：构造记录值 ----------
+        # 默认值
+        final_fields = {"座位名称": seat_name}
+        # 用户传入的 fields 覆盖默认值（座位名称也可以被覆盖）
+        final_fields.update(fields)
+        # 确保有默认的座位类型和是否已订
+        if "座位类型" not in final_fields:
+            final_fields["座位类型"] = "大厅"
+
+        # ---------- 步骤 3：应用订座规则 ----------
+        merged_booking_values = {}
+        for field_title in BOOKING_RELATED_FIELDS:
+            val = final_fields.get(field_title, "")
+            merged_booking_values[field_title] = str(val) if val else ""
+
+        any_non_empty = any(v for v in merged_booking_values.values())
+        booking_status = "已订座" if any_non_empty else "未订座"
+        final_fields["是否已订"] = booking_status
+
+        # ---------- 步骤 4：校验字段名 + 构造 payload ----------
+        unknown_fields = [f for f in final_fields if f not in field_map]
+        if unknown_fields:
+            raise ValueError(f"以下字段不存在于工作表中：{unknown_fields}")
+
+        # 构造记录：只填 final_fields 中的字段，其余字段由企业微信默认为空
+        record_values = {}
+        for field_title, value in final_fields.items():
+            field_type = field_map[field_title]["field_type"]
+            record_values[field_title] = _build_update_value(field_type, value)
+
+        # 添加记录
+        add_resp = api_wework.add_records(
+            client, token, doc_id, sheet_id,
+            [{"values": record_values}]
+        )
+        # 从返回值中提取 record_id
+        added_records = add_resp.get("records", [])
+        record_id = added_records[0].get("record_id") if added_records else None
+
+    # ---------- 步骤 5：操作日志 ----------
+    user_id = db.insert_user(operator_userid, operator_name)
+    detail = {
+        "sheet_name": sheet_name,
+        "sheet_id": sheet_id,
+        "seat_name": seat_name,
+        "record_id": record_id,
+        "fields": final_fields,
+        "booking_status": booking_status,
+        "operator": {"userid": operator_userid, "name": operator_name},
+    }
+    db.insert_log(
+        operator_id=user_id,
+        target_id=sheet_row["id"],
+        operation_type="add_record",
+        target_type="sheet",
+        detail=detail,
+    )
+
+    logging.info(f"添加记录成功：{sheet_name} / {seat_name}（record_id={record_id}）")
+    return {
+        "sheet_name": sheet_name,
+        "sheet_id": sheet_id,
+        "seat_name": seat_name,
+        "record_id": record_id,
+        "fields": final_fields,
+        "booking_status": booking_status,
+    }
+
+
+# ============================================================
+# 工具8：删除记录（从指定工作表删除指定记录）
+# ============================================================
+def delete_record_and_sync(
+    corp_id: str,
+    secret: str,
+    operator_userid: str,
+    operator_name: str,
+    sheet_date: str,
+    session: str,
+    seat_name: str = None,
+    record_id: str = None,
+    default_sessions: List[Tuple[str, str]] = None,
+) -> Dict[str, Any]:
+    """从指定工作表删除指定记录
+
+    定位方式（二选一，record_id 优先）：
+        - record_id: 直接按记录 ID 删除
+        - seat_name:  按座位名称查找后删除
+
+    参数:
+        sheet_date + session: 确定工作表
+        record_id:   记录 ID（优先）
+        seat_name:   座位名称（若未提供 record_id 则按此查找）
+
+    返回: {
+        "sheet_name": str,
+        "sheet_id": str,
+        "deleted_record_id": str,
+        "seat_name": str,
+        "deleted_at": str,
+    }
+    """
+    if default_sessions is None:
+        default_sessions = [("lunch", "午市"), ("dinner", "晚市")]
+
+    if not record_id and not seat_name:
+        raise ValueError("请提供 record_id 或 seat_name 之一来定位记录")
+
+    # ---------- 步骤 0：解析参数，定位工作表 ----------
+    target_date = _parse_date_str(sheet_date)
+    normalized = _normalize_sessions(session, default_sessions)
+    _session_type, session_label = normalized[0]
+    sheet_name = _make_sheet_name(target_date, session_label)
+
+    sheet_row = db.get_sheet_by_name(sheet_name)
+    if not sheet_row:
+        raise ValueError(
+            f"工作表不存在：{sheet_name}（日期={target_date.isoformat()}, 场次={session_label}）"
+        )
+    sheet_id = sheet_row["sheet_id"]
+    doc_id = sheet_row["doc_id"]
+
+    # ---------- 步骤 1：定位记录 ----------
+    with httpx.Client(timeout=30) as client:
+        token = api_wework.get_access_token(client, corp_id, secret)
+
+        if record_id:
+            # 按 record_id 删除（不需要先查询记录）
+            target_record_id = record_id
+            target_seat_name = seat_name or ""
+        else:
+            # 按 seat_name 查找记录
+            records_resp = api_wework.get_records(client, token, doc_id, sheet_id, limit=100)
+            all_records = records_resp.get("records", [])
+            total = records_resp.get("total", len(all_records))
+
+            # 防御性分页
+            next_offset = records_resp.get("next_offset")
+            while next_offset and next_offset < total:
+                more_resp = api_wework.get_records(client, token, doc_id, sheet_id, offset=next_offset, limit=100)
+                all_records.extend(more_resp.get("records", []))
+                next_offset = more_resp.get("next_offset")
+
+            target_record = None
+            for rec in all_records:
+                values = rec.get("values", {})
+                seat_val = _extract_text_value(values.get("座位名称", []))
+                if seat_val == seat_name:
+                    target_record = rec
+                    break
+
+            if not target_record:
+                raise ValueError(f"在工作表 {sheet_name} 中未找到座位：{seat_name}")
+
+            target_record_id = target_record["record_id"]
+            target_seat_name = seat_name
+
+        # ---------- 步骤 2：删除记录 ----------
+        api_wework.delete_records(client, token, doc_id, sheet_id, [target_record_id])
+
+    # ---------- 步骤 3：操作日志 ----------
+    user_id = db.insert_user(operator_userid, operator_name)
+    deleted_at = datetime.now().isoformat(timespec="seconds")
+    detail = {
+        "sheet_name": sheet_name,
+        "sheet_id": sheet_id,
+        "deleted_record_id": target_record_id,
+        "seat_name": target_seat_name,
+        "deleted_at": deleted_at,
+        "operator": {"userid": operator_userid, "name": operator_name},
+    }
+    db.insert_log(
+        operator_id=user_id,
+        target_id=sheet_row["id"],
+        operation_type="delete_record",
+        target_type="sheet",
+        detail=detail,
+    )
+
+    logging.info(f"删除记录成功：{sheet_name} / {target_seat_name}（record_id={target_record_id}）")
+    return {
+        "sheet_name": sheet_name,
+        "sheet_id": sheet_id,
+        "deleted_record_id": target_record_id,
+        "seat_name": target_seat_name,
+        "deleted_at": deleted_at,
+    }

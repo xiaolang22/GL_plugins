@@ -9,7 +9,7 @@ import uvicorn
 sys.path.append(os.path.dirname(__file__))
 
 from db import init_db
-from composite import create_smart_sheet_and_sync, create_template_sheet_and_sync, create_bulk_sheets_and_sync, create_any_sheet_and_sync, delete_sheet_and_sync, update_record_and_sync, SEAT_DATA
+from composite import create_smart_sheet_and_sync, create_template_sheet_and_sync, create_bulk_sheets_and_sync, create_any_sheet_and_sync, delete_sheet_and_sync, update_record_and_sync, add_record_and_sync, delete_record_and_sync, SEAT_DATA
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -305,6 +305,142 @@ async def tool_update_record(request: Request):
         }
     except Exception as e:
         logging.error(f"更新记录失败: {e}")
+        return {"content": f"❌ 操作失败: {str(e)}"}
+
+@app.post("/add_record")
+async def tool_add_record(request: Request):
+    """工具7：向指定工作表添加一条新记录
+
+    默认值：
+      - 座位名称 = 传入的 seat_name
+      - 座位类型 = "大厅"
+      - 是否已订 = "未订座"（自动按订座规则计算）
+      - 其余字段 = 空
+
+    订座规则（自动应用）：
+      - 客人称呼/客人电话/人数/留菜/留位人 任一非空 → "是否已订" = "已订座"
+      - 全部为空 → "是否已订" = "未订座"
+
+    请求 Body（JSON）示例：
+      - 添加空白座位（全部默认值）：
+        {"date": "2026-09-26", "session": "dinner", "seat_name": "临时桌A",
+         "operator_userid": "xxx", "operator_name": "yyy"}
+
+      - 添加并填写客人信息：
+        {"date": "2026-09-26", "session": "dinner", "seat_name": "临时桌B",
+         "fields": {"客人称呼": "王五", "客人电话": "13900000000", "人数": "4", "座位类型": "房间"},
+         "operator_userid": "xxx", "operator_name": "yyy"}
+    """
+    try:
+        body = await request.json()
+        sheet_date = body.get("date")
+        session = body.get("session")
+        seat_name = body.get("seat_name")
+        fields = body.get("fields", {})
+        operator_userid = body.get("operator_userid", "system")
+        operator_name = body.get("operator_name", "系统")
+
+        if not sheet_date:
+            return {"content": "❌ 参数错误：请提供 date"}
+        if not session:
+            return {"content": "❌ 参数错误：请提供 session（lunch/dinner/午市/晚市）"}
+        if not seat_name:
+            return {"content": "❌ 参数错误：请提供 seat_name"}
+
+        result = add_record_and_sync(
+            CORP_ID, SECRET, operator_userid, operator_name,
+            sheet_date=sheet_date,
+            session=session,
+            seat_name=seat_name,
+            fields=fields,
+            default_sessions=SESSIONS,
+        )
+
+        field_lines = []
+        for k, v in result["fields"].items():
+            field_lines.append(f"  · {k}：{v}")
+
+        msg = (
+            f"✅ 成功添加记录\n"
+            f"📅 工作表：{result['sheet_name']}\n"
+            f"🪑 座位：{result['seat_name']}\n"
+            f"🔖 record_id：{result['record_id']}\n"
+            f"📝 记录内容：\n"
+            + "\n".join(field_lines)
+            + f"\n🔔 订座状态：{result['booking_status']}"
+        )
+
+        return {
+            "content": msg,
+            "sheet_name": result["sheet_name"],
+            "seat_name": result["seat_name"],
+            "record_id": result["record_id"],
+            "fields": result["fields"],
+            "booking_status": result["booking_status"],
+        }
+    except Exception as e:
+        logging.error(f"添加记录失败: {e}")
+        return {"content": f"❌ 操作失败: {str(e)}"}
+
+@app.post("/delete_record")
+async def tool_delete_record(request: Request):
+    """工具8：从指定工作表删除指定记录
+
+    定位方式（二选一，record_id 优先）：
+      - record_id: 直接按记录 ID 删除
+      - seat_name:  按座位名称查找后删除
+
+    请求 Body（JSON）示例：
+      - 按座位名称删除：
+        {"date": "2026-09-26", "session": "dinner", "seat_name": "临时桌A",
+         "operator_userid": "xxx", "operator_name": "yyy"}
+
+      - 按 record_id 删除：
+        {"date": "2026-09-26", "session": "dinner", "record_id": "recXXXXXX",
+         "operator_userid": "xxx", "operator_name": "yyy"}
+    """
+    try:
+        body = await request.json()
+        sheet_date = body.get("date")
+        session = body.get("session")
+        seat_name = body.get("seat_name")
+        record_id = body.get("record_id")
+        operator_userid = body.get("operator_userid", "system")
+        operator_name = body.get("operator_name", "系统")
+
+        if not sheet_date:
+            return {"content": "❌ 参数错误：请提供 date"}
+        if not session:
+            return {"content": "❌ 参数错误：请提供 session（lunch/dinner/午市/晚市）"}
+        if not record_id and not seat_name:
+            return {"content": "❌ 参数错误：请提供 record_id 或 seat_name 之一"}
+
+        result = delete_record_and_sync(
+            CORP_ID, SECRET, operator_userid, operator_name,
+            sheet_date=sheet_date,
+            session=session,
+            seat_name=seat_name,
+            record_id=record_id,
+            default_sessions=SESSIONS,
+        )
+
+        msg = (
+            f"✅ 成功删除记录\n"
+            f"📅 工作表：{result['sheet_name']}\n"
+            f"🪑 座位：{result['seat_name'] or '（按record_id删除）'}\n"
+            f"🔖 record_id：{result['deleted_record_id']}\n"
+            f"🕒 删除时间：{result['deleted_at']}"
+        )
+
+        return {
+            "content": msg,
+            "sheet_name": result["sheet_name"],
+            "deleted_record_id": result["deleted_record_id"],
+            "seat_name": result["seat_name"],
+            "deleted_at": result["deleted_at"],
+        }
+    except Exception as e:
+        logging.error(f"删除记录失败: {e}")
         return {"content": f"❌ 操作失败: {str(e)}"}
 
 @app.get("/health")

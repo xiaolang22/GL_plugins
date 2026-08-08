@@ -213,3 +213,21 @@ def update_records(client: httpx.Client, access_token: str, docid: str, sheet_id
     if result.get("errcode") != 0:
         raise Exception(f"更新记录失败: {result}")
     return result
+
+
+def delete_records(client: httpx.Client, access_token: str, docid: str, sheet_id: str, record_ids: List[str]) -> Dict[str, Any]:
+    """删除记录（按 record_id 批量删除）
+
+    record_ids: 要删除的记录 ID 列表
+    """
+    url = f"https://qyapi.weixin.qq.com/cgi-bin/wedoc/smartsheet/delete_records?access_token={access_token}"
+    payload = {
+        "docid": docid,
+        "sheet_id": sheet_id,
+        "records": record_ids,
+    }
+    resp = client.post(url, json=payload)
+    result = resp.json()
+    if result.get("errcode") != 0:
+        raise Exception(f"删除记录失败: {result}")
+    return result
