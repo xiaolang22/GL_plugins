@@ -264,3 +264,45 @@ def get_existing_sheet_names(names: list) -> list:
     rows = cursor.fetchall()
     conn.close()
     return [r["sheet_name"] for r in rows]
+
+
+# ================= 删除相关 =================
+def get_sheet_by_name(sheet_name: str) -> dict:
+    """按 sheet_name 查询单条工作表记录，不存在返回 None"""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute('SELECT * FROM sheets WHERE sheet_name = ? LIMIT 1', (sheet_name,))
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def get_sheet_by_id(sheet_id: str) -> dict:
+    """按 sheet_id 查询单条工作表记录，不存在返回 None"""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute('SELECT * FROM sheets WHERE sheet_id = ? LIMIT 1', (sheet_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def delete_sheet_by_id(sheet_id: str) -> int:
+    """按 sheet_id 删除工作表记录，返回被删除的行数"""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute('DELETE FROM sheets WHERE sheet_id = ?', (sheet_id,))
+    conn.commit()
+    deleted = cursor.rowcount
+    conn.close()
+    return deleted
+
+
+def is_template_sheet(sheet_id: str) -> bool:
+    """检查指定 sheet_id 是否为模板工作表"""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute('SELECT 1 FROM templates WHERE sheet_id = ? LIMIT 1', (sheet_id,))
+    exists = cursor.fetchone() is not None
+    conn.close()
+    return exists

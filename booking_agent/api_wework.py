@@ -162,3 +162,35 @@ def get_records(client: httpx.Client, access_token: str, docid: str, sheet_id: s
     if result.get("errcode") != 0:
         raise Exception(f"查询记录失败: {result}")
     return result  # 包含 total, records, next_offset
+
+
+def delete_sheet(client: httpx.Client, access_token: str, docid: str, sheet_id: str) -> Dict[str, Any]:
+    """删除子表（企业微信智能表格删除指定 sheet_id 的子表）
+
+    注意：企业微信不允许删除所有子表，文档内至少需保留 1 张子表。
+    """
+    url = f"https://qyapi.weixin.qq.com/cgi-bin/wedoc/smartsheet/delete_sheet?access_token={access_token}"
+    payload = {
+        "docid": docid,
+        "sheet_id": sheet_id,
+    }
+    resp = client.post(url, json=payload)
+    result = resp.json()
+    if result.get("errcode") != 0:
+        raise Exception(f"删除子表失败: {result}")
+    return result
+
+
+def get_sheet_list(client: httpx.Client, access_token: str, docid: str, offset: int = 0, limit: int = 100) -> Dict[str, Any]:
+    """查询智能表格内的子表列表（用于按 sheet_id 校验存在性、判断是否最后一张）"""
+    url = f"https://qyapi.weixin.qq.com/cgi-bin/wedoc/smartsheet/get_sheet?access_token={access_token}"
+    payload = {
+        "docid": docid,
+        "offset": offset,
+        "limit": limit,
+    }
+    resp = client.post(url, json=payload)
+    result = resp.json()
+    if result.get("errcode") != 0:
+        raise Exception(f"查询子表列表失败: {result}")
+    return result  # 含 sheet_list: [{sheet_id, title, ...}]

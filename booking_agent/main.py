@@ -9,7 +9,7 @@ import uvicorn
 sys.path.append(os.path.dirname(__file__))
 
 from db import init_db
-from composite import create_smart_sheet_and_sync, create_template_sheet_and_sync, create_bulk_sheets_and_sync, create_any_sheet_and_sync, SEAT_DATA
+from composite import create_smart_sheet_and_sync, create_template_sheet_and_sync, create_bulk_sheets_and_sync, create_any_sheet_and_sync, delete_sheet_and_sync, SEAT_DATA
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -17,7 +17,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 CORP_ID = "ww742ff47a509b856e"
 SECRET = "Iu6AYICGeiAe2kx3YyTSefTEZsld42U6EkGsQ2ON2QA"
 DEFAULT_ADMIN_USERS = ["ChenDaHong"]  # 可指定初始管理员 userid 列表
-BULK_SHEETS_MONTHS = 3  # 批量新建工作表时，默认创建未来几个月
+BULK_SHEETS_MONTHS = 1  # 批量新建工作表时，默认创建未来几个月
 SESSIONS = [("lunch", "午市"), ("dinner", "晚市")]  # 一天的市场配置：(session_type, 显示名)，按顺序创建
 BULK_SHEETS_MAX_WORKERS = 5  # 批量创建工作表阶段二并发填充的并发数
 # ===========================================
@@ -178,6 +178,55 @@ async def tool_create_sheet(request: Request):
         }
     except Exception as e:
         logging.error(f"新建工作表失败: {e}")
+        return {"content": f"❌ 操作失败: {str(e)}"}
+
+@app.post("/delete_sheet")
+async def tool_delete_sheet(request: Request):
+    """工具5：删除数据库第一个智能表格中的指定工作表
+
+    校验规则：
+      1. 必须提供 sheet_name 或 sheet_id 之一
+      2. 工作表必须在本地 sheets 表中存在
+      3. 不允许删除模板工作表（templates 表中的记录一律拒绝）
+      4. 不允许删除文档内最后一张子表（企业微信限制）
+
+    请求 Body（JSON）示例：
+      - 按名称删除（推荐）：
+        {"sheet_name": "9-26晚市周六", "operator_userid": "xxx", "operator_name": "yyy"}
+      - 按 sheet_id 删除：
+        {"sheet_id": "xxxxxx", "operator_userid": "xxx", "operator_name": "yyy"}
+      - 同时提供时以 sheet_id 为准
+    """
+    try:
+        body = await request.json()
+        sheet_name = body.get("sheet_name")
+        sheet_id = body.get("sheet_id")
+        operator_userid = body.get("operator_userid", "system")
+        operator_name = body.get("operator_name", "系统")
+
+        if not sheet_name and not sheet_id:
+            return {"content": "❌ 参数错误：请提供 sheet_name 或 sheet_id 之一"}
+
+        result = delete_sheet_and_sync(
+            CORP_ID, SECRET, operator_userid, operator_name,
+            sheet_name=sheet_name,
+            sheet_id=sheet_id,
+        )
+
+        msg = (
+            f"✅ 成功删除工作表\n"
+            f"📄 工作表：{result['sheet_name']}\n"
+            f"🔖 sheet_id：{result['sheet_id']}\n"
+            f"🕒 删除时间：{result['deleted_at']}"
+        )
+        return {
+            "content": msg,
+            "sheet_id": result["sheet_id"],
+            "sheet_name": result["sheet_name"],
+            "deleted_at": result["deleted_at"],
+        }
+    except Exception as e:
+        logging.error(f"删除工作表失败: {e}")
         return {"content": f"❌ 操作失败: {str(e)}"}
 
 @app.get("/health")

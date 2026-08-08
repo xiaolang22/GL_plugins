@@ -822,3 +822,116 @@ def create_any_sheet_and_sync(
         "skipped_count": 0,
         "sheets": sheet_results,
     }
+
+
+# ============================================================
+# 工具5：删除工作表（外部可访问，不允许删除模板）
+# ============================================================
+def delete_sheet_and_sync(
+    corp_id: str,
+    secret: str,
+    operator_userid: str,
+    operator_name: str,
+    sheet_name: str = None,
+    sheet_id: str = None,
+) -> Dict[str, Any]:
+    """针对数据库第一个智能表格，删除指定工作表
+
+    参数（二选一）：
+        sheet_name: 工作表名称（推荐，对调用方更友好）
+        sheet_id:   工作表 ID（优先使用，若同时提供则以 sheet_id 为准）
+
+    校验规则：
+        1. 必须提供 sheet_name 或 sheet_id 之一
+        2. 数据库第一个智能表格必须存在
+        3. 工作表必须在本地 sheets 表中存在（按 sheet_id/sheet_name 查询）
+        4. 不允许删除模板工作表（templates 表中的 sheet_id 一律拒绝）
+        5. 不允许删除文档内最后一张子表（企业微信限制）
+
+    返回: {
+        "sheet_id": str,
+        "sheet_name": str,
+        "deleted_at": str,        # ISO 时间
+        "doc_id": str,
+    }
+    """
+    # ---------- 步骤 0：参数与前置校验 ----------
+    if not sheet_name and not sheet_id:
+        raise ValueError("请提供 sheet_name 或 sheet_id 之一")
+
+    doc_id = db.get_first_doc()
+    if not doc_id:
+        raise Exception("数据库中还没有智能表格，无法删除")
+
+    # 优先按 sheet_id 查；若没给 sheet_id 则按 sheet_name 查
+    if sheet_id:
+        sheet_row = db.get_sheet_by_id(sheet_id)
+        if not sheet_row:
+            raise ValueError(f"工作表不存在（sheet_id={sheet_id}）")
+        if not sheet_name:
+            sheet_name = sheet_row["sheet_name"]
+    else:
+        sheet_row = db.get_sheet_by_name(sheet_name)
+        if not sheet_row:
+            raise ValueError(f"工作表不存在（sheet_name={sheet_name}）")
+        sheet_id = sheet_row["sheet_id"]
+
+    # 一致性校验：DB 里的 doc_id 必须是第一个智能表格的 doc_id
+    if sheet_row["doc_id"] != doc_id:
+        raise ValueError(
+            f"该工作表不属于第一个智能表格（sheet 的 doc_id={sheet_row['doc_id']}，"
+            f"第一个智能表格 doc_id={doc_id}），不允许跨文档删除"
+        )
+
+    # 校验 1：不允许删除模板工作表
+    if db.is_template_sheet(sheet_id):
+        raise ValueError(f"不允许删除模板工作表：{sheet_name}（sheet_id={sheet_id}）")
+
+    # 操作人入库
+    user_id = db.insert_user(operator_userid, operator_name)
+
+    # ---------- 步骤 1：远端校验 + 删除 ----------
+    with httpx.Client(timeout=30) as client:
+        token = api_wework.get_access_token(client, corp_id, secret)
+
+        # 校验 2：不允许删除文档内最后一张子表
+        sheet_list_resp = api_wework.get_sheet_list(client, token, doc_id)
+        remote_sheets = sheet_list_resp.get("sheet_list", [])
+        if len(remote_sheets) <= 1:
+            raise ValueError("文档内仅剩最后一张子表，企业微信不允许删除全部子表")
+
+        # 执行远端删除
+        api_wework.delete_sheet(client, token, doc_id, sheet_id)
+
+    # ---------- 步骤 2：同步本地数据库 ----------
+    deleted_rows = db.delete_sheet_by_id(sheet_id)
+    if deleted_rows == 0:
+        # 远端删除成功但本地无记录（理论上前面查重已经拦截），记录警告但不报错
+        logging.warning(f"远端已删除，但本地 sheets 表无此记录：sheet_id={sheet_id}")
+
+    # ---------- 步骤 3：操作日志 ----------
+    deleted_at = datetime.now().isoformat(timespec="seconds")
+    detail = {
+        "sheet_id": sheet_id,
+        "sheet_name": sheet_name,
+        "doc_id": doc_id,
+        "deleted_at": deleted_at,
+        "operator": {"userid": operator_userid, "name": operator_name},
+    }
+    # target_id 用本地 sheets 表的原 id（如果有的话）
+    target_id = sheet_row["id"] if "id" in sheet_row.keys() else 0
+    db.insert_log(
+        operator_id=user_id,
+        target_id=target_id,
+        operation_type="delete_sheet",
+        target_type="sheet",
+        detail=detail,
+    )
+
+    logging.info(f"删除工作表成功：{sheet_name}（sheet_id={sheet_id}）")
+    return {
+        "sheet_id": sheet_id,
+        "sheet_name": sheet_name,
+        "doc_id": doc_id,
+        "deleted_at": deleted_at,
+    }
