@@ -72,6 +72,49 @@ BUFFER_SCHEDULE_HOUR = 0    # 每日执行小时（北京时间，默认 0 = 零
 BUFFER_SCHEDULE_MINUTE = 0  # 每日执行分钟（默认 0 分）
 BUFFER_DAYS_FUTURE = BULK_SHEETS_DAYS  # buffer 未来几天（含今天），默认与批量创建保持一致
 BUFFER_PAST_DAYS = BUFFER_DAYS_PAST  # buffer 过去几天（不含今天）
+
+# ---- 字段英文↔中文双向映射（仅 /update_record /add_record 接口层翻译，内部 composite 仍用中文）----
+FIELD_KEY_EN_TO_ZH = {
+    "seat_name": "座位名称",
+    "seat_capacity": "座位容量",
+    "seat_remark": "座位备注",
+    "guest_name": "客人称呼",
+    "guest_phone": "客人电话",
+    "guest_count": "人数",
+    "reserved_dishes": "留菜",
+    "reserved_by": "留位人",
+    "seat_type": "座位类型",
+    "booking_status": "是否已订",
+}
+FIELD_KEY_ZH_TO_EN = {zh: en for en, zh in FIELD_KEY_EN_TO_ZH.items()}
+
+
+def _translate_fields_keys(d: dict, mapping: dict, strict: bool = False) -> dict:
+    """翻译字典 key，忽略不在 mapping 中的 key（strict=False 时原样保留）。
+    strict=True 时，遇到未知 key 会抛 ValueError（用于入参校验）。"""
+    if not d:
+        return {}
+    result = {}
+    for k, v in d.items():
+        if k in mapping:
+            result[mapping[k]] = v
+        else:
+            if strict:
+                raise ValueError(
+                    f"未知字段 key：{k!r}，有效值为：{sorted(mapping.keys())}"
+                )
+            result[k] = v
+    return result
+
+
+def _fields_en_to_zh(d: dict, strict: bool = False) -> dict:
+    """输入层：英文字典 key → 中文 key，交给 composite 处理"""
+    return _translate_fields_keys(d, FIELD_KEY_EN_TO_ZH, strict=strict)
+
+
+def _fields_zh_to_en(d: dict, strict: bool = False) -> dict:
+    """输出层：中文字典 key → 英文 key，返回给大模型/调用方"""
+    return _translate_fields_keys(d, FIELD_KEY_ZH_TO_EN, strict=strict)
 # ===========================================
 
 app = FastAPI()
@@ -363,33 +406,36 @@ async def tool_update_record(request: Request):
     """工具6：更新指定工作表中指定座位记录的字段值（订座信息）
 
     自动应用订座规则：
-      - 客人称呼/客人电话/人数/留菜/留位人 任一非空 → "是否已订"自动设为"已订座"
-      - 全部为空 → "是否已订"自动设为"未订座"
+      - guest_name/guest_phone/guest_count/reserved_dishes/reserved_by 任一非空
+        → booking_status 自动设为 "已订座"
+      - 全部为空 → booking_status 自动设为 "未订座"
       （判断基于更新后的最终值，即当前值 + 更新值合并后）
 
     请求 Body（JSON）示例：
       - 订座（填入客人信息）：
         {"date": "2026-09-26", "session": "dinner", "seat_name": "北京房",
-         "fields": {"客人称呼": "张三", "客人电话": "13800138000", "人数": "8"},
+         "fields": {"guest_name": "张三", "guest_phone": "13800138000", "guest_count": "8"},
          "operator_userid": "xxx", "operator_name": "yyy"}
 
       - 取消订座（清空客人信息）：
         {"date": "2026-09-26", "session": "dinner", "seat_name": "北京房",
-         "fields": {"客人称呼": "", "客人电话": "", "人数": "", "留菜": "", "留位人": ""},
+         "fields": {"guest_name": "", "guest_phone": "", "guest_count": "", "reserved_dishes": "", "reserved_by": ""},
          "operator_userid": "xxx", "operator_name": "yyy"}
 
     参数说明：
       - date:    日期（YYYY-MM-DD / MM-DD）
       - session: 场次（lunch/dinner/午市/晚市）
       - seat_name: 座位名称（如"北京房"）
-      - fields:  要更新的字段字典，支持任意字段名
+      - fields:  要更新的字段字典，支持的英文 key：
+                 seat_name, seat_capacity, seat_remark, guest_name, guest_phone,
+                 guest_count, reserved_dishes, reserved_by, seat_type, booking_status
     """
     try:
         body = await request.json()
         sheet_date = body.get("date")
         session = body.get("session")
         seat_name = body.get("seat_name")
-        fields = body.get("fields", {})
+        fields_en = body.get("fields", {})
         operator_userid = body.get("operator_userid", "system")
         operator_name = body.get("operator_name", "系统")
 
@@ -399,20 +445,29 @@ async def tool_update_record(request: Request):
             return {"content": "❌ 参数错误：请提供 session（lunch/dinner/午市/晚市）"}
         if not seat_name:
             return {"content": "❌ 参数错误：请提供 seat_name"}
-        if not fields:
+        if not fields_en:
             return {"content": "❌ 参数错误：请提供 fields（要更新的字段）"}
+
+        # 输入层：英文 key → 中文 key，交给内部逻辑处理
+        try:
+            fields_zh = _fields_en_to_zh(fields_en, strict=True)
+        except ValueError as ve:
+            return {"content": f"❌ 参数错误：{str(ve)}"}
 
         result = update_record_and_sync(
             CORP_ID, SECRET, operator_userid, operator_name,
             sheet_date=sheet_date,
             session=session,
             seat_name=seat_name,
-            fields=fields,
+            fields=fields_zh,
             default_sessions=SESSIONS,
         )
 
+        # 输出层：中文 key → 英文 key，返回给调用方
+        updated_fields_en = _fields_zh_to_en(result["updated_fields"])
+
         updated_lines = []
-        for k, v in result["updated_fields"].items():
+        for k, v in updated_fields_en.items():
             updated_lines.append(f"  · {k}：{v}")
 
         msg = (
@@ -429,7 +484,7 @@ async def tool_update_record(request: Request):
             "sheet_name": result["sheet_name"],
             "seat_name": result["seat_name"],
             "record_id": result["record_id"],
-            "updated_fields": result["updated_fields"],
+            "updated_fields": updated_fields_en,
             "booking_status": result["booking_status"],
         }
     except Exception as e:
@@ -441,14 +496,15 @@ async def tool_add_record(request: Request):
     """工具7：向指定工作表添加一条新记录
 
     默认值：
-      - 座位名称 = 传入的 seat_name
-      - 座位类型 = "大厅"
-      - 是否已订 = "未订座"（自动按订座规则计算）
+      - seat_name = 传入的 seat_name
+      - seat_type = "大厅"
+      - booking_status = "未订座"（自动按订座规则计算）
       - 其余字段 = 空
 
     订座规则（自动应用）：
-      - 客人称呼/客人电话/人数/留菜/留位人 任一非空 → "是否已订" = "已订座"
-      - 全部为空 → "是否已订" = "未订座"
+      - guest_name/guest_phone/guest_count/reserved_dishes/reserved_by 任一非空
+        → booking_status = "已订座"
+      - 全部为空 → booking_status = "未订座"
 
     请求 Body（JSON）示例：
       - 添加空白座位（全部默认值）：
@@ -457,15 +513,19 @@ async def tool_add_record(request: Request):
 
       - 添加并填写客人信息：
         {"date": "2026-09-26", "session": "dinner", "seat_name": "临时桌B",
-         "fields": {"客人称呼": "王五", "客人电话": "13900000000", "人数": "4", "座位类型": "房间"},
+         "fields": {"guest_name": "王五", "guest_phone": "13900000000", "guest_count": "4", "seat_type": "房间"},
          "operator_userid": "xxx", "operator_name": "yyy"}
+
+    fields 支持的英文 key：
+      seat_name, seat_capacity, seat_remark, guest_name, guest_phone,
+      guest_count, reserved_dishes, reserved_by, seat_type, booking_status
     """
     try:
         body = await request.json()
         sheet_date = body.get("date")
         session = body.get("session")
         seat_name = body.get("seat_name")
-        fields = body.get("fields", {})
+        fields_en = body.get("fields", {})
         operator_userid = body.get("operator_userid", "system")
         operator_name = body.get("operator_name", "系统")
 
@@ -476,17 +536,26 @@ async def tool_add_record(request: Request):
         if not seat_name:
             return {"content": "❌ 参数错误：请提供 seat_name"}
 
+        # 输入层：英文 key → 中文 key，交给内部逻辑处理
+        try:
+            fields_zh = _fields_en_to_zh(fields_en, strict=True)
+        except ValueError as ve:
+            return {"content": f"❌ 参数错误：{str(ve)}"}
+
         result = add_record_and_sync(
             CORP_ID, SECRET, operator_userid, operator_name,
             sheet_date=sheet_date,
             session=session,
             seat_name=seat_name,
-            fields=fields,
+            fields=fields_zh,
             default_sessions=SESSIONS,
         )
 
+        # 输出层：中文 key → 英文 key，返回给调用方
+        fields_en_out = _fields_zh_to_en(result["fields"])
+
         field_lines = []
-        for k, v in result["fields"].items():
+        for k, v in fields_en_out.items():
             field_lines.append(f"  · {k}：{v}")
 
         msg = (
@@ -504,7 +573,7 @@ async def tool_add_record(request: Request):
             "sheet_name": result["sheet_name"],
             "seat_name": result["seat_name"],
             "record_id": result["record_id"],
-            "fields": result["fields"],
+            "fields": fields_en_out,
             "booking_status": result["booking_status"],
         }
     except Exception as e:
