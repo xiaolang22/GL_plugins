@@ -63,7 +63,7 @@ if not _HAS_PYTZ:
 CORP_ID = "ww742ff47a509b856e"
 SECRET = "Iu6AYICGeiAe2kx3YyTSefTEZsld42U6EkGsQ2ON2QA"
 DEFAULT_ADMIN_USERS = ["ChenDaHong"]  # 可指定初始管理员 userid 列表
-BULK_SHEETS_DAYS = 90  # 批量新建工作表时，默认创建未来几天（含今天）
+BULK_SHEETS_DAYS = 30  # 批量新建工作表时，默认创建未来几天（含今天）
 SESSIONS = [("lunch", "午市"), ("dinner", "晚市")]  # 一天的市场配置：(session_type, 显示名)，按顺序创建
 BULK_SHEETS_MAX_WORKERS = 5  # 批量创建工作表阶段二并发填充的并发数
 
