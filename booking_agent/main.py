@@ -356,39 +356,60 @@ async def tool_create_sheet(request: Request):
 async def tool_delete_sheet(request: Request):
     """工具5：删除数据库第一个智能表格中的指定工作表
 
+    定位方式（三选一，优先级从高到低）：
+      1. date + session   → 日期+场次定位（推荐，不需要记工作表全名）
+      2. sheet_id         → 按工作表 ID（最精确）
+      3. sheet_name       → 按工作表全名（兼容旧写法）
+
     校验规则：
-      1. 必须提供 sheet_name 或 sheet_id 之一
+      1. 必须提供 (date+session) 或 sheet_name 或 sheet_id 之一
       2. 工作表必须在本地 sheets 表中存在
       3. 不允许删除模板工作表（templates 表中的记录一律拒绝）
       4. 不允许删除文档内最后一张子表（企业微信限制）
 
     请求 Body（JSON）示例：
-      - 按名称删除（推荐）：
+      - 按日期+场次删除（推荐）：
+        {"date": "2026-09-26", "session": "dinner", "operator_userid": "xxx", "operator_name": "yyy"}
+        {"date": "9-26", "session": "晚市", "operator_userid": "xxx", "operator_name": "yyy"}
+      - 按名称删除（兼容旧逻辑）：
         {"sheet_name": "9-26晚市周六", "operator_userid": "xxx", "operator_name": "yyy"}
       - 按 sheet_id 删除：
         {"sheet_id": "xxxxxx", "operator_userid": "xxx", "operator_name": "yyy"}
-      - 同时提供时以 sheet_id 为准
+      - 同时提供多种时：date+session > sheet_id > sheet_name
     """
     try:
         body = await request.json()
+        sheet_date = body.get("date")
+        session = body.get("session")
         sheet_name = body.get("sheet_name")
         sheet_id = body.get("sheet_id")
         operator_userid = body.get("operator_userid", "system")
         operator_name = body.get("operator_name", "系统")
 
-        if not sheet_name and not sheet_id:
-            return {"content": "❌ 参数错误：请提供 sheet_name 或 sheet_id 之一"}
+        if not sheet_name and not sheet_id and not (sheet_date and session):
+            return {"content": "❌ 参数错误：请提供 date+session 或 sheet_name 或 sheet_id 之一"}
 
         result = delete_sheet_and_sync(
             CORP_ID, SECRET, operator_userid, operator_name,
             sheet_name=sheet_name,
             sheet_id=sheet_id,
+            sheet_date=sheet_date,
+            session=session,
+            default_sessions=SESSIONS,
         )
+
+        # 定位方式的中文说明（便于给大模型看）
+        located_label = {
+            "date_session": "日期+场次",
+            "sheet_id": "sheet_id",
+            "sheet_name": "工作表名称",
+        }.get(result.get("located_by"), result.get("located_by", ""))
 
         msg = (
             f"✅ 成功删除工作表\n"
             f"📄 工作表：{result['sheet_name']}\n"
             f"🔖 sheet_id：{result['sheet_id']}\n"
+            f"🧭 定位方式：{located_label}\n"
             f"🕒 删除时间：{result['deleted_at']}"
         )
         return {
@@ -396,6 +417,7 @@ async def tool_delete_sheet(request: Request):
             "sheet_id": result["sheet_id"],
             "sheet_name": result["sheet_name"],
             "deleted_at": result["deleted_at"],
+            "located_by": result["located_by"],
         }
     except Exception as e:
         logging.error(f"删除工作表失败: {e}")

@@ -863,18 +863,22 @@ def delete_sheet_and_sync(
     operator_name: str,
     sheet_name: str = None,
     sheet_id: str = None,
+    sheet_date: str = None,
+    session: str = None,
+    default_sessions: List[Tuple[str, str]] = None,
 ) -> Dict[str, Any]:
     """针对数据库第一个智能表格，删除指定工作表
 
-    参数（二选一）：
-        sheet_name: 工作表名称（推荐，对调用方更友好）
-        sheet_id:   工作表 ID（优先使用，若同时提供则以 sheet_id 为准）
+    定位优先级（从高到低）：
+      1. sheet_date + session → 日期+场次定位（新功能，最友好）
+      2. sheet_id → 直接按 ID（若同时提供则覆盖上面）
+      3. sheet_name → 按名称
 
     校验规则：
-        1. 必须提供 sheet_name 或 sheet_id 之一
+        1. 必须提供 (sheet_date + session) 或 sheet_name 或 sheet_id 之一
         2. 数据库第一个智能表格必须存在
-        3. 工作表必须在本地 sheets 表中存在（按 sheet_id/sheet_name 查询）
-        4. 不允许删除模板工作表（templates 表中的 sheet_id 一律拒绝）
+        3. 工作表必须在本地 sheets 表中存在
+        4. 不允许删除模板工作表（templates 表中的记录一律拒绝）
         5. 不允许删除文档内最后一张子表（企业微信限制）
 
     返回: {
@@ -882,28 +886,60 @@ def delete_sheet_and_sync(
         "sheet_name": str,
         "deleted_at": str,        # ISO 时间
         "doc_id": str,
+        "located_by": str,        # 定位方式：date_session / sheet_id / sheet_name
     }
     """
+    if default_sessions is None:
+        default_sessions = [("lunch", "午市"), ("dinner", "晚市")]
+
     # ---------- 步骤 0：参数与前置校验 ----------
-    if not sheet_name and not sheet_id:
-        raise ValueError("请提供 sheet_name 或 sheet_id 之一")
+    if not sheet_name and not sheet_id and not (sheet_date and session):
+        raise ValueError("请提供 sheet_date+session 或 sheet_name 或 sheet_id 之一")
 
     doc_id = db.get_first_doc()
     if not doc_id:
         raise Exception("数据库中还没有智能表格，无法删除")
 
-    # 优先按 sheet_id 查；若没给 sheet_id 则按 sheet_name 查
-    if sheet_id:
+    located_by = None
+    sheet_row = None
+
+    # 优先级 1：sheet_date + session
+    if sheet_date and session:
+        target_date = _parse_date_str(sheet_date)
+        normalized = _normalize_sessions(session, default_sessions)
+        if len(normalized) != 1:
+            raise ValueError(
+                f"session 参数一次只能指定一场用于删除，当前解析出 {len(normalized)} 场："
+                f"{[x[0] for x in normalized]}，请传入单个值如 'dinner' 或 '晚市'"
+            )
+        session_type, _session_label = normalized[0]
+        sheet_row = db.get_sheet_by_date_and_session(
+            target_date.isoformat(), session_type, doc_id
+        )
+        if not sheet_row:
+            raise ValueError(
+                f"工作表不存在（日期={target_date.isoformat()}, 场次={session_type}）"
+            )
+        sheet_id = sheet_row["sheet_id"]
+        sheet_name = sheet_row["sheet_name"]
+        located_by = "date_session"
+
+    # 优先级 2：按 sheet_id
+    if not located_by and sheet_id:
         sheet_row = db.get_sheet_by_id(sheet_id)
         if not sheet_row:
             raise ValueError(f"工作表不存在（sheet_id={sheet_id}）")
         if not sheet_name:
             sheet_name = sheet_row["sheet_name"]
-    else:
+        located_by = "sheet_id"
+
+    # 优先级 3：按 sheet_name（兼容旧逻辑）
+    if not located_by:
         sheet_row = db.get_sheet_by_name(sheet_name)
         if not sheet_row:
             raise ValueError(f"工作表不存在（sheet_name={sheet_name}）")
         sheet_id = sheet_row["sheet_id"]
+        located_by = "sheet_name"
 
     # 一致性校验：DB 里的 doc_id 必须是第一个智能表格的 doc_id
     if sheet_row["doc_id"] != doc_id:
@@ -957,12 +993,13 @@ def delete_sheet_and_sync(
         detail=detail,
     )
 
-    logging.info(f"删除工作表成功：{sheet_name}（sheet_id={sheet_id}）")
+    logging.info(f"删除工作表成功：{sheet_name}（sheet_id={sheet_id}, 定位={located_by}）")
     return {
         "sheet_id": sheet_id,
         "sheet_name": sheet_name,
         "doc_id": doc_id,
         "deleted_at": deleted_at,
+        "located_by": located_by,
     }
 
 

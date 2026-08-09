@@ -304,6 +304,29 @@ def get_sheet_by_id(sheet_id: str) -> dict:
     return dict(row) if row else None
 
 
+def get_sheet_by_date_and_session(sheet_date: str, session_type: str, doc_id: str = None) -> dict:
+    """按日期 + 场次定位唯一工作表（同一个 doc 下 date + session_type 是唯一键）
+    session_type: 'lunch' 或 'dinner'（传入时已标准化）
+    sheet_date: 'YYYY-MM-DD'（传入时已标准化）
+    doc_id: 可选，若不指定则查第一个 doc
+    不存在返回 None"""
+    conn = get_connection()
+    cursor = conn.cursor()
+    if doc_id:
+        cursor.execute(
+            'SELECT * FROM sheets WHERE sheet_date = ? AND session_type = ? AND doc_id = ? LIMIT 1',
+            (sheet_date, session_type, doc_id)
+        )
+    else:
+        cursor.execute(
+            'SELECT * FROM sheets WHERE sheet_date = ? AND session_type = ? LIMIT 1',
+            (sheet_date, session_type)
+        )
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
 def delete_sheet_by_id(sheet_id: str) -> int:
     """按 sheet_id 删除工作表记录，返回被删除的行数"""
     conn = get_connection()
