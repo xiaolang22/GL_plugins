@@ -224,7 +224,7 @@ def delete_records(client: httpx.Client, access_token: str, docid: str, sheet_id
     payload = {
         "docid": docid,
         "sheet_id": sheet_id,
-        "records": record_ids,
+        "record_ids": record_ids,
     }
     resp = client.post(url, json=payload)
     result = resp.json()
