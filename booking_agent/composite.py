@@ -1,5 +1,4 @@
 import logging
-import calendar
 import httpx
 import time
 from datetime import date, datetime, timedelta
@@ -284,16 +283,6 @@ def create_template_sheet_and_sync(corp_id: str, secret: str, template_name: str
     return {"sheet_id": sheet_id, "template_db_id": template_db_id}
 
 
-def _add_months(d: date, months: int) -> date:
-    """日期加几个月，自动处理月末溢出（如 1月31日 + 1月 = 2月28/29日）"""
-    month = d.month - 1 + months  # 转为 0-indexed 计算
-    year = d.year + month // 12
-    month = month % 12 + 1  # 转回 1-indexed
-    last_day = calendar.monthrange(year, month)[1]
-    day = min(d.day, last_day)
-    return date(year, month, day)
-
-
 def _build_field_payload(field_def: Dict) -> Dict:
     """把 template_content 中的字段定义转为 add_fields 的 payload 格式"""
     payload = {"field_title": field_def["field_title"], "field_type": field_def["field_type"]}
@@ -387,10 +376,10 @@ def _create_one_sheet_from_template(client: httpx.Client, token: str, doc_id: st
 
 
 def create_bulk_sheets_and_sync(corp_id: str, secret: str, operator_userid: str, operator_name: str,
-                                 months: int = 3, sessions: List[tuple] = None,
+                                 days: int = 90, sessions: List[tuple] = None,
                                  max_workers: int = 5) -> Dict[str, Any]:
     """
-    复合操作3：批量新建工作表（从今天起未来 months 个月），三阶段流水线加速
+    复合操作3：批量新建工作表（从今天起未来 days 天，含今天），三阶段流水线加速
     - 模板内容从数据库读取（templates.template_content）
     - 一天创建多张工作表（默认午市+晚市）
     - 命名规则：{月}-{日}{午市/晚市}{星期}，如 "9-26晚市周六"
@@ -433,9 +422,9 @@ def create_bulk_sheets_and_sync(corp_id: str, secret: str, operator_userid: str,
     with httpx.Client(timeout=30) as client:
         token = api_wework.get_access_token(client, corp_id, secret)
 
-        # 3. 计算日期范围（从今天到 months 个月后的同一天前一天，与需求示例一致：6月1日 → 8月31日）
+        # 3. 计算日期范围（从今天起未来 days 天，含今天：today ~ today + days - 1）
         start_date = date.today()
-        end_date = _add_months(start_date, months) - timedelta(days=1)
+        end_date = start_date + timedelta(days=days - 1)
 
         # 4. 构建任务列表（按日期顺序排列，确保阶段一串行创建的子表顺序正确）
         tasks = []  # 每项: {"sheet_name", "sheet_date", "session_type", "weekday"}
@@ -1574,10 +1563,10 @@ def query_records_and_sync(
 # 工具10：自动化 buffer 管理（每日零点执行）
 # ============================================================
 
-def _calc_buffer_range(months: int, today: date = None) -> Tuple[date, date]:
+def _calc_buffer_range(days: int, today: date = None) -> Tuple[date, date]:
     """计算 buffer 时间范围
     - buffer_start: 今天 - BUFFER_DAYS_PAST 天（不含今天 → 严格小于今天）
-    - buffer_end:   与批量创建子表计算一致：当月第一天加 months 个月再减 1 天
+    - buffer_end:   与批量创建子表计算一致：今天加 days 天再减 1 天（含今天，共 days 天）
     返回 (buffer_start, buffer_end)
     """
     if today is None:
@@ -1586,14 +1575,8 @@ def _calc_buffer_range(months: int, today: date = None) -> Tuple[date, date]:
     # 过去 N 天（不含今天）：例 今天=6.8，N=7 → start=6.1（即 date < today 且 >= start）
     buffer_start = today - timedelta(days=BUFFER_DAYS_PAST)
 
-    # 未来 buffer_end：与批量创建保持一致
-    # 取当月第一天，加 months 个月，再减 1 天
-    first_day_of_month = today.replace(day=1)
-    buffer_end = _add_months(first_day_of_month, months) - timedelta(days=1)
-
-    # buffer_end 如果小于今天（极端情况），至少保证到今天
-    if buffer_end < today:
-        buffer_end = today
+    # 未来 buffer_end：与批量创建保持一致（today ~ today + days - 1，共 days 天）
+    buffer_end = today + timedelta(days=days - 1)
 
     return buffer_start, buffer_end
 
@@ -1652,6 +1635,7 @@ def _supplement_new_sheets(
     current_total: int,
     operator_userid: str,
     operator_name: str,
+    days: int,
 ) -> Dict[str, Any]:
     """补足 buffer 范围内的新工作表
     - 从 max(buffer_max_date + 1 day, today) 开始创建，直到 buffer_end
@@ -1677,10 +1661,8 @@ def _supplement_new_sheets(
     # 起始补表日期：buffer_max_date 的下一天，但不能早于今天（今天和未来才需要补）
     start_supplement = max(buffer_max_date + timedelta(days=1), today)
 
-    # buffer_end：和批量创建一致（重新调用统一函数）
-    _buf_start, buffer_end = _calc_buffer_range(BULK_SHEETS_MONTHS_CACHE, today)
-    # 注：BULK_SHEETS_MONTHS_CACHE 由调用方在模块内注入，实际在主流程传 months 参数
-    # 为避免耦合，这里直接通过参数传 months 的值由外部传入（看下面实际调用点）
+    # buffer_end：和批量创建一致（today ~ today + days - 1）
+    _buf_start, buffer_end = _calc_buffer_range(days, today)
 
     created = []
     skipped_due_to_limit = []
@@ -1753,22 +1735,12 @@ def _supplement_new_sheets(
     }
 
 
-# 缓存：补新表时需要知道 BULK_SHEETS_MONTHS，由 main.py 初始化时注入
-BULK_SHEETS_MONTHS_CACHE = 3
-
-
-def set_bulk_months_cache(months: int) -> None:
-    """设置批量创建月份数缓存（供 buffer 计算复用）"""
-    global BULK_SHEETS_MONTHS_CACHE
-    BULK_SHEETS_MONTHS_CACHE = int(months)
-
-
 def buffer_manage_and_sync(
     corp_id: str,
     secret: str,
     operator_userid: str,
     operator_name: str,
-    months: int = None,
+    days: int = 90,
     sessions: List[Tuple[str, str]] = None,
     past_days: int = None,
 ) -> Dict[str, Any]:
@@ -1780,14 +1752,12 @@ def buffer_manage_and_sync(
       3. （新建表之前检查是否超限）补足 buffer 上新工作表
 
     参数:
-        months:     buffer 未来几个月（默认用缓存值）
+        days:       buffer 未来几天（含今天，默认 90；实际生效值由 main.py 的 BUFFER_DAYS_FUTURE 传入）
         sessions:   场次配置（默认午市+晚市）
         past_days:  buffer 过去几天（默认用常量 BUFFER_DAYS_PAST）
 
     返回: 各阶段统计明细
     """
-    if months is None:
-        months = BULK_SHEETS_MONTHS_CACHE
     if sessions is None:
         sessions = [("lunch", "午市"), ("dinner", "晚市")]
     if past_days is None:
@@ -1797,7 +1767,7 @@ def buffer_manage_and_sync(
     today_str = today.isoformat()
     logging.info(f"[buffer] ==== 开始执行 buffer 管理 ====")
     logging.info(f"[buffer] 虚拟今天 = {today_str}（偏移 {get_time_offset_days()} 天）")
-    logging.info(f"[buffer] 参数：months={months}, past_days={past_days}, sessions={sessions}")
+    logging.info(f"[buffer] 参数：days={days}, past_days={past_days}, sessions={sessions}")
 
     # ---------- 准备数据 ----------
     doc_id = db.get_first_doc()
@@ -1811,7 +1781,7 @@ def buffer_manage_and_sync(
     user_id = db.insert_user(operator_userid, operator_name)
 
     # ------------ 步骤 1：更新 buffer 范围标记 ------------
-    buffer_start, buffer_end = _calc_buffer_range(months, today)
+    buffer_start, buffer_end = _calc_buffer_range(days, today)
     buffer_start_str = buffer_start.isoformat()
     buffer_end_str = buffer_end.isoformat()
     logging.info(f"[buffer] 步骤1：buffer 范围 [{buffer_start_str}, {buffer_end_str}]")
@@ -1895,11 +1865,6 @@ def buffer_manage_and_sync(
             "current_total": current_total,
         }
     else:
-        # 临时修改 global 常量（不推荐，改为传参数）——改用直接在函数内接受 months
-        # _supplement_new_sheets 内部会重新算 buffer_end，为一致我们先更新全局缓存
-        old_cache = BULK_SHEETS_MONTHS_CACHE
-        set_bulk_months_cache(months)
-
         with httpx.Client(timeout=30) as client:
             token = api_wework.get_access_token(client, corp_id, secret)
             supplement_result = _supplement_new_sheets(
@@ -1913,12 +1878,10 @@ def buffer_manage_and_sync(
                 current_total=current_total,
                 operator_userid=operator_userid,
                 operator_name=operator_name,
+                days=days,
             )
             # 重新统计总表数
             supplement_result["current_total_after"] = db.count_sheets_and_templates()
-
-        # 恢复缓存
-        set_bulk_months_cache(old_cache)
 
         # 补表日志
         for item in supplement_result["created"]:

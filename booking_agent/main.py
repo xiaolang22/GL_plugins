@@ -47,7 +47,6 @@ from composite import (
     get_time_offset_days,
     get_virtual_today,
     get_virtual_now,
-    set_bulk_months_cache,
     MAX_SHEETS_LIMIT,
     BUFFER_DAYS_PAST,
 )
@@ -64,14 +63,14 @@ if not _HAS_PYTZ:
 CORP_ID = "ww742ff47a509b856e"
 SECRET = "Iu6AYICGeiAe2kx3YyTSefTEZsld42U6EkGsQ2ON2QA"
 DEFAULT_ADMIN_USERS = ["ChenDaHong"]  # 可指定初始管理员 userid 列表
-BULK_SHEETS_MONTHS = 1  # 批量新建工作表时，默认创建未来几个月
+BULK_SHEETS_DAYS = 90  # 批量新建工作表时，默认创建未来几天（含今天）
 SESSIONS = [("lunch", "午市"), ("dinner", "晚市")]  # 一天的市场配置：(session_type, 显示名)，按顺序创建
 BULK_SHEETS_MAX_WORKERS = 5  # 批量创建工作表阶段二并发填充的并发数
 
 # ---- buffer 自动管理参数 ----
 BUFFER_SCHEDULE_HOUR = 0    # 每日执行小时（北京时间，默认 0 = 零点）
 BUFFER_SCHEDULE_MINUTE = 0  # 每日执行分钟（默认 0 分）
-BUFFER_MONTHS = BULK_SHEETS_MONTHS  # buffer 未来几个月，默认与批量创建保持一致
+BUFFER_DAYS_FUTURE = BULK_SHEETS_DAYS  # buffer 未来几天（含今天），默认与批量创建保持一致
 BUFFER_PAST_DAYS = BUFFER_DAYS_PAST  # buffer 过去几天（不含今天）
 # ===========================================
 
@@ -80,9 +79,7 @@ app = FastAPI()
 # 初始化数据库
 init_db()
 
-# 同步 BULK_SHEETS_MONTHS 到 composite 缓存
-set_bulk_months_cache(BULK_SHEETS_MONTHS)
-logging.info(f"[启动] buffer 参数：未来 {BUFFER_MONTHS} 个月，过去 {BUFFER_PAST_DAYS} 天，"
+logging.info(f"[启动] buffer 参数：未来 {BUFFER_DAYS_FUTURE} 天，过去 {BUFFER_PAST_DAYS} 天，"
              f"每日 {BUFFER_SCHEDULE_HOUR:02d}:{BUFFER_SCHEDULE_MINUTE:02d} 北京时间执行")
 
 
@@ -96,7 +93,7 @@ def _buffer_job_wrapper():
             secret=SECRET,
             operator_userid="scheduler",
             operator_name="定时任务",
-            months=BUFFER_MONTHS,
+            days=BUFFER_DAYS_FUTURE,
             sessions=SESSIONS,
             past_days=BUFFER_PAST_DAYS,
         )
@@ -205,18 +202,18 @@ async def tool_create_template(request: Request):
 
 @app.post("/create_bulk_sheets")
 async def tool_create_bulk_sheets(request: Request):
-    """工具3：批量新建工作表（三阶段流水线加速，默认未来三个月，每天午市+晚市）"""
+    """工具3：批量新建工作表（三阶段流水线加速，默认未来90天，每天午市+晚市）"""
     try:
         body = await request.json()
         operator_userid = body.get("operator_userid", "system")
         operator_name = body.get("operator_name", "系统")
-        months = body.get("months", BULK_SHEETS_MONTHS)
+        days = body.get("days", BULK_SHEETS_DAYS)
         sessions = body.get("sessions", SESSIONS)
         max_workers = body.get("max_workers", BULK_SHEETS_MAX_WORKERS)
 
         result = create_bulk_sheets_and_sync(
             CORP_ID, SECRET, operator_userid, operator_name,
-            months=months, sessions=sessions, max_workers=max_workers
+            days=days, sessions=sessions, max_workers=max_workers
         )
         # 构造分阶段统计信息
         msg = (
@@ -733,27 +730,27 @@ async def test_trigger_buffer(request: Request):
     执行顺序：1.更新buffer范围 → 2.删除过期离散表 → 3.补新表（255限额检查）
 
     可选参数（覆盖默认值，便于测试）：
-      - months:    buffer 未来几个月（默认用 BUFFER_MONTHS）
-      - past_days: buffer 过去几天（默认用 BUFFER_PAST_DAYS）
+      - days:       buffer 未来几天（默认用 BUFFER_DAYS_FUTURE）
+      - past_days:  buffer 过去几天（默认用 BUFFER_PAST_DAYS）
 
     请求 Body 示例：
       {}                                → 使用默认参数执行
-      {"months": 2, "past_days": 3}    → 自定义 buffer 范围
+      {"days": 60, "past_days": 3}     → 自定义 buffer 范围
     """
     try:
         body = await request.json() or {}
-        months = body.get("months", BUFFER_MONTHS)
+        days = body.get("days", BUFFER_DAYS_FUTURE)
         past_days = body.get("past_days", BUFFER_PAST_DAYS)
         operator_userid = body.get("operator_userid", "test_trigger")
         operator_name = body.get("operator_name", "测试手动触发")
 
-        logging.info(f"[测试触发] 手动触发 buffer 管理：months={months}, past_days={past_days}")
+        logging.info(f"[测试触发] 手动触发 buffer 管理：days={days}, past_days={past_days}")
         result = buffer_manage_and_sync(
             corp_id=CORP_ID,
             secret=SECRET,
             operator_userid=operator_userid,
             operator_name=operator_name,
-            months=months,
+            days=days,
             sessions=SESSIONS,
             past_days=past_days,
         )
