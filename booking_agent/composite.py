@@ -1973,3 +1973,260 @@ def buffer_manage_and_sync(
         "total_sheets_after": final_total,
         "max_limit": MAX_SHEETS_LIMIT,
     }
+
+
+# ============================================================
+# 回调同步：人工修改工作表记录后，通过企业微信回调自动同步本地数据库
+# ============================================================
+
+def sync_remote_record_change(
+    corp_id: str,
+    secret: str,
+    doc_id: str,
+    sheet_id: str,
+    record_ids: List[str],
+    operator_userid: str,
+    change_type: str,
+    default_sessions: List[Tuple[str, str]] = None,
+) -> Dict[str, Any]:
+    """处理人工更新/添加记录的回调同步
+
+    当人在企业微信前端修改或新增记录后，企业微信会推送 update_record / add_record 回调。
+    回调只告知哪些 record_id 被改了，不告知具体改了什么字段。
+    本函数的逻辑：
+      1. 查本地 sheets 表定位工作表（模板表和非本地表跳过）
+      2. 拉取远端记录最新值
+      3. 对每个 record_id 重新计算是否已订规则
+      4. 如果远端"是否已订"与规则不一致 → 调 update_records 修正
+      5. 写 log 表
+
+    参数:
+        corp_id, secret: 企业微信凭证
+        doc_id: 回调中的 DocId
+        sheet_id: 回调中的 SheetId
+        record_ids: 回调中的 RecordId 列表
+        operator_userid: 回调中的 FromUserName（操作人 userid）
+        change_type: "update_record" 或 "add_record"
+
+    返回: {
+        "sheet_name": str,
+        "change_type": str,
+        "synced_count": int,       # 同步的记录数
+        "corrected_count": int,    # 修正了是否已订的记录数
+        "corrections": list,       # 修正详情
+        "skipped": bool,           # 是否跳过（模板表/非本地表）
+    }
+    """
+    if default_sessions is None:
+        default_sessions = [("lunch", "午市"), ("dinner", "晚市")]
+
+    # ---------- 步骤 0：查本地 sheets 表定位工作表 ----------
+    sheet_row = db.get_sheet_by_id(sheet_id)
+    if not sheet_row:
+        if db.is_template_sheet(sheet_id):
+            logging.info(f"[回调同步] 跳过模板工作表：{sheet_id}")
+        else:
+            logging.warning(f"[回调同步] 工作表不在本地数据库中：{sheet_id}")
+        return {"skipped": True, "reason": "sheet not in local DB or is template"}
+
+    sheet_name = sheet_row["sheet_name"]
+    local_doc_id = sheet_row["doc_id"]
+
+    logging.info(
+        f"[回调同步] {change_type}: 工作表={sheet_name}, "
+        f"record_ids={record_ids}, operator={operator_userid}"
+    )
+
+    # ---------- 步骤 1：拉取远端字段 + 记录 ----------
+    with httpx.Client(timeout=30) as client:
+        token = api_wework.get_access_token(client, corp_id, secret)
+
+        # 拉取字段（用于获取"是否已订"的 field_type）
+        fields_resp = api_wework.get_fields(client, token, local_doc_id, sheet_id)
+        field_map = {f["field_title"]: f for f in fields_resp.get("fields", [])}
+
+        # 拉取全部记录（座位表每张最多 ~20 条，一次拉完）
+        records_resp = api_wework.get_records(client, token, local_doc_id, sheet_id, limit=100)
+        all_records = records_resp.get("records", [])
+        total = records_resp.get("total", len(all_records))
+
+        # 防御性分页
+        next_offset = records_resp.get("next_offset")
+        while next_offset and next_offset < total:
+            more_resp = api_wework.get_records(
+                client, token, local_doc_id, sheet_id, offset=next_offset, limit=100
+            )
+            all_records.extend(more_resp.get("records", []))
+            next_offset = more_resp.get("next_offset")
+
+        # ---------- 步骤 2：对每个 record_id 重新计算是否已订 ----------
+        synced_records = []
+        corrections = []
+
+        for rid in record_ids:
+            # 在拉取的记录列表中找到目标记录
+            target = None
+            for rec in all_records:
+                if rec.get("record_id") == rid:
+                    target = rec
+                    break
+
+            if not target:
+                logging.warning(f"[回调同步] 记录未找到：{rid}（可能已被删除）")
+                continue
+
+            values = target.get("values", {})
+            seat_name = _extract_text_value(values.get("座位名称", []))
+
+            # 提取 BOOKING_RELATED_FIELDS 的当前值
+            booking_values = {}
+            for field_title in BOOKING_RELATED_FIELDS:
+                booking_values[field_title] = _extract_text_value(values.get(field_title, []))
+
+            # 重新计算是否已订
+            any_non_empty = any(v for v in booking_values.values())
+            expected_status = "已订座" if any_non_empty else "未订座"
+
+            # 获取远端当前"是否已订"的值
+            current_status = _extract_text_value(values.get("是否已订", []))
+
+            record_info = {
+                "record_id": rid,
+                "seat_name": seat_name,
+                "expected_booking_status": expected_status,
+                "current_booking_status": current_status,
+                "needs_correction": expected_status != current_status,
+            }
+            synced_records.append(record_info)
+
+            # ---------- 步骤 3：如果不一致，调 API 修正 ----------
+            if expected_status != current_status:
+                # 构造更新 payload
+                is_booked_field_type = field_map.get("是否已订", {}).get("field_type", "FIELD_TYPE_SINGLE_SELECT")
+                update_values = {
+                    "是否已订": _build_update_value(is_booked_field_type, expected_status)
+                }
+                api_wework.update_records(
+                    client, token, local_doc_id, sheet_id,
+                    [{"record_id": rid, "values": update_values}]
+                )
+                corrections.append({
+                    "record_id": rid,
+                    "seat_name": seat_name,
+                    "old_status": current_status,
+                    "new_status": expected_status,
+                })
+                logging.info(
+                    f"[回调同步] 修正订座状态：{sheet_name} / {seat_name} "
+                    f"{current_status} → {expected_status}"
+                )
+
+    # ---------- 步骤 4：写操作日志 ----------
+    user_id = db.insert_user(operator_userid, operator_userid)
+    detail = {
+        "sheet_name": sheet_name,
+        "sheet_id": sheet_id,
+        "change_type": change_type,
+        "synced_records": synced_records,
+        "corrections": corrections,
+        "operator": {"userid": operator_userid},
+        "source": "callback",
+    }
+    db.insert_log(
+        operator_id=user_id,
+        target_id=sheet_row["id"],
+        operation_type=f"sync_{change_type}",
+        target_type="sheet",
+        detail=detail,
+    )
+
+    logging.info(
+        f"[回调同步] {change_type} 完成: {sheet_name}, "
+        f"同步 {len(synced_records)} 条, 修正 {len(corrections)} 条"
+    )
+
+    return {
+        "sheet_name": sheet_name,
+        "change_type": change_type,
+        "synced_count": len(synced_records),
+        "corrected_count": len(corrections),
+        "corrections": corrections,
+        "skipped": False,
+    }
+
+
+def sync_remote_record_delete(
+    corp_id: str,
+    secret: str,
+    doc_id: str,
+    sheet_id: str,
+    record_ids: List[str],
+    operator_userid: str,
+    default_sessions: List[Tuple[str, str]] = None,
+) -> Dict[str, Any]:
+    """处理人工删除记录的回调同步
+
+    当人在企业微信前端删除记录后，企业微信会推送 delete_record 回调。
+    远端记录已删除，不需要拉取，只需写 log 表。
+
+    参数:
+        corp_id, secret: 企业微信凭证
+        doc_id: 回调中的 DocId
+        sheet_id: 回调中的 SheetId
+        record_ids: 被删除的 RecordId 列表
+        operator_userid: 回调中的 FromUserName（操作人 userid）
+
+    返回: {
+        "sheet_name": str,
+        "deleted_record_ids": list,
+        "deleted_count": int,
+        "skipped": bool,
+    }
+    """
+    if default_sessions is None:
+        default_sessions = [("lunch", "午市"), ("dinner", "晚市")]
+
+    # ---------- 步骤 0：查本地 sheets 表定位工作表 ----------
+    sheet_row = db.get_sheet_by_id(sheet_id)
+    if not sheet_row:
+        if db.is_template_sheet(sheet_id):
+            logging.info(f"[回调同步] 跳过模板工作表：{sheet_id}")
+        else:
+            logging.warning(f"[回调同步] 工作表不在本地数据库中：{sheet_id}")
+        return {"skipped": True, "reason": "sheet not in local DB or is template"}
+
+    sheet_name = sheet_row["sheet_name"]
+
+    logging.info(
+        f"[回调同步] delete_record: 工作表={sheet_name}, "
+        f"record_ids={record_ids}, operator={operator_userid}"
+    )
+
+    # ---------- 步骤 1：写操作日志 ----------
+    user_id = db.insert_user(operator_userid, operator_userid)
+    detail = {
+        "sheet_name": sheet_name,
+        "sheet_id": sheet_id,
+        "deleted_record_ids": record_ids,
+        "operator": {"userid": operator_userid},
+        "source": "callback",
+    }
+    db.insert_log(
+        operator_id=user_id,
+        target_id=sheet_row["id"],
+        operation_type="sync_delete_record",
+        target_type="sheet",
+        detail=detail,
+    )
+
+    logging.info(
+        f"[回调同步] delete_record 完成: {sheet_name}, "
+        f"删除 {len(record_ids)} 条记录"
+    )
+
+    return {
+        "sheet_name": sheet_name,
+        "deleted_record_ids": record_ids,
+        "deleted_count": len(record_ids),
+        "skipped": False,
+    }

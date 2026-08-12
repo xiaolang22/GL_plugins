@@ -4,6 +4,7 @@ import logging
 import json
 from datetime import date, datetime, timedelta, timezone
 from fastapi import FastAPI, Request
+from fastapi.responses import PlainTextResponse
 import uvicorn
 
 # ================= 可选依赖兜底：APScheduler + pytz =================
@@ -49,7 +50,11 @@ from composite import (
     get_virtual_now,
     MAX_SHEETS_LIMIT,
     BUFFER_DAYS_PAST,
+    # 回调同步
+    sync_remote_record_change,
+    sync_remote_record_delete,
 )
+import wecom_callback
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -72,6 +77,11 @@ BUFFER_SCHEDULE_HOUR = 0    # 每日执行小时（北京时间，默认 0 = 零
 BUFFER_SCHEDULE_MINUTE = 0  # 每日执行分钟（默认 0 分）
 BUFFER_DAYS_FUTURE = BULK_SHEETS_DAYS  # buffer 未来几天（含今天），默认与批量创建保持一致
 BUFFER_PAST_DAYS = BUFFER_DAYS_PAST  # buffer 过去几天（不含今天）
+
+# ---- 回调同步参数 ----
+# 在企业微信后台「自建应用 → 接收消息 → 设置API接收」中配置
+CALLBACK_TOKEN = "ryaWSkQqLtgzlDFylCF596b9kmxG"                # 回调 Token（后台生成或手动填写）
+CALLBACK_ENCODING_AES_KEY = "Pmx11AhQn3fYQh1zTi7bxS1XCuiLMbA5vC8Fesqi8Bz"     # 回调 EncodingAESKey（43位，后台生成或手动填写）
 
 # ---- 字段英文↔中文双向映射（仅 /update_record /add_record 接口层翻译，内部 composite 仍用中文）----
 FIELD_KEY_EN_TO_ZH = {
@@ -706,6 +716,115 @@ async def tool_query_records(request: Request):
 @app.get("/health")
 async def health_check():
     return {"status": "ok"}
+
+
+# ============================================================
+# 企业微信回调：接收记录变更事件，自动同步本地数据库
+# 这是内部自动化端点，不对外暴露为工具
+# ============================================================
+
+@app.get("/callback/wecom")
+async def verify_callback_url(msg_signature: str, timestamp: str, nonce: str, echostr: str):
+    """企业微信后台配置回调URL时的验证接口（GET）
+
+    企业微信会发送 GET 请求，携带 msg_signature / timestamp / nonce / echostr。
+    验证签名通过后，解密 echostr 并返回明文。
+    """
+    if not CALLBACK_TOKEN or not CALLBACK_ENCODING_AES_KEY:
+        logging.error("[回调] CALLBACK_TOKEN 或 CALLBACK_ENCODING_AES_KEY 未配置")
+        return PlainTextResponse("callback not configured", status_code=500)
+    try:
+        plain = wecom_callback.verify_url(
+            msg_signature=msg_signature,
+            timestamp=timestamp,
+            nonce=nonce,
+            echostr=echostr,
+            token=CALLBACK_TOKEN,
+            encoding_aes_key=CALLBACK_ENCODING_AES_KEY,
+            corp_id=CORP_ID,
+        )
+        return PlainTextResponse(plain)
+    except Exception as e:
+        logging.error(f"[回调] URL验证失败: {e}")
+        return PlainTextResponse(f"verify failed: {e}", status_code=403)
+
+
+@app.post("/callback/wecom")
+async def receive_callback(msg_signature: str, timestamp: str, nonce: str, request: Request):
+    """接收企业微信记录变更回调（POST）
+
+    企业微信在用户修改/新增/删除智能表格记录时，推送此回调。
+    回调内容为加密 XML，验签解密后解析出变更详情，调用 composite 同步函数。
+
+    响应必须返回纯文本 "success"，否则企业微信会重试。
+    """
+    if not CALLBACK_TOKEN or not CALLBACK_ENCODING_AES_KEY:
+        logging.error("[回调] CALLBACK_TOKEN 或 CALLBACK_ENCODING_AES_KEY 未配置")
+        return PlainTextResponse("callback not configured", status_code=500)
+
+    try:
+        body = await request.body()
+
+        # 验签 + 解密 + 解析
+        callback_data = wecom_callback.parse_callback(
+            msg_signature=msg_signature,
+            timestamp=timestamp,
+            nonce=nonce,
+            body=body,
+            token=CALLBACK_TOKEN,
+            encoding_aes_key=CALLBACK_ENCODING_AES_KEY,
+            corp_id=CORP_ID,
+        )
+
+        event = callback_data.get("event", "")
+        change_type = callback_data.get("change_type", "")
+
+        # 只处理智能表格记录变更事件
+        if event != "smart_sheet_change":
+            logging.info(f"[回调] 非智能表格事件，跳过: event={event}")
+            return PlainTextResponse("success")
+
+        doc_id = callback_data["doc_id"]
+        sheet_id = callback_data["sheet_id"]
+        record_ids = callback_data["record_ids"]
+        from_user = callback_data["from_user"]
+
+        if not record_ids:
+            logging.info("[回调] record_ids 为空，跳过")
+            return PlainTextResponse("success")
+
+        # 分发到对应的同步函数
+        if change_type in ("update_record", "add_record"):
+            sync_remote_record_change(
+                corp_id=CORP_ID,
+                secret=SECRET,
+                doc_id=doc_id,
+                sheet_id=sheet_id,
+                record_ids=record_ids,
+                operator_userid=from_user,
+                change_type=change_type,
+                default_sessions=SESSIONS,
+            )
+        elif change_type == "delete_record":
+            sync_remote_record_delete(
+                corp_id=CORP_ID,
+                secret=SECRET,
+                doc_id=doc_id,
+                sheet_id=sheet_id,
+                record_ids=record_ids,
+                operator_userid=from_user,
+                default_sessions=SESSIONS,
+            )
+        else:
+            logging.info(f"[回调] 未知 ChangeType，跳过: {change_type}")
+
+        return PlainTextResponse("success")
+
+    except Exception as e:
+        # 即使处理失败也返回 success，避免企业微信重试
+        # （重试不会修复代码bug，只会造成重复日志）
+        logging.error(f"[回调] 处理失败: {e}", exc_info=True)
+        return PlainTextResponse("success")
 
 
 # ============================================================
