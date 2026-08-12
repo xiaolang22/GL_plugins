@@ -723,30 +723,39 @@ async def health_check():
 # 这是内部自动化端点，不对外暴露为工具
 # ============================================================
 
+def _get_callback_crypt():
+    """创建回调官方 SDK 实例；若未配置则返回 None"""
+    if not CALLBACK_TOKEN or not CALLBACK_ENCODING_AES_KEY:
+        logging.error("[回调] CALLBACK_TOKEN 或 CALLBACK_ENCODING_AES_KEY 未配置")
+        return None
+    try:
+        return wecom_callback.make_crypt(CALLBACK_TOKEN, CALLBACK_ENCODING_AES_KEY, CORP_ID)
+    except Exception as e:
+        logging.error(f"[回调] 初始化 SDK 失败: {e}")
+        return None
+
+
 @app.get("/callback/wecom")
 async def verify_callback_url(msg_signature: str, timestamp: str, nonce: str, echostr: str):
     """企业微信后台配置回调URL时的验证接口（GET）
 
     企业微信会发送 GET 请求，携带 msg_signature / timestamp / nonce / echostr。
     验证签名通过后，解密 echostr 并返回明文。
+
+    注意：无论验证是否通过，都返回 200 + 明文（或空串），与 test 目录的已跑通实现对齐。
+    企业微信要求：验证失败时不能返回 403/500，否则提示回调地址请求不通过。
     """
-    if not CALLBACK_TOKEN or not CALLBACK_ENCODING_AES_KEY:
-        logging.error("[回调] CALLBACK_TOKEN 或 CALLBACK_ENCODING_AES_KEY 未配置")
-        return PlainTextResponse("callback not configured", status_code=500)
+    logging.info("=== [回调] 收到 URL 验证请求 ===")
+    wxcpt = _get_callback_crypt()
+    if not wxcpt:
+        return PlainTextResponse(content="", status_code=200)
     try:
-        plain = wecom_callback.verify_url(
-            msg_signature=msg_signature,
-            timestamp=timestamp,
-            nonce=nonce,
-            echostr=echostr,
-            token=CALLBACK_TOKEN,
-            encoding_aes_key=CALLBACK_ENCODING_AES_KEY,
-            corp_id=CORP_ID,
-        )
-        return PlainTextResponse(plain)
+        plain = wecom_callback.verify_url(wxcpt, msg_signature, timestamp, nonce, echostr)
+        logging.info(f"[回调] URL 验证通过，返回内容: {plain}")
+        return PlainTextResponse(content=plain, status_code=200)
     except Exception as e:
         logging.error(f"[回调] URL验证失败: {e}")
-        return PlainTextResponse(f"verify failed: {e}", status_code=403)
+        return PlainTextResponse(content="", status_code=200)
 
 
 @app.post("/callback/wecom")
@@ -756,24 +765,22 @@ async def receive_callback(msg_signature: str, timestamp: str, nonce: str, reque
     企业微信在用户修改/新增/删除智能表格记录时，推送此回调。
     回调内容为加密 XML，验签解密后解析出变更详情，调用 composite 同步函数。
 
-    响应必须返回纯文本 "success"，否则企业微信会重试。
+    响应必须返回纯文本 "success"（或空串），状态码 200，否则企业微信会重试。
     """
-    if not CALLBACK_TOKEN or not CALLBACK_ENCODING_AES_KEY:
-        logging.error("[回调] CALLBACK_TOKEN 或 CALLBACK_ENCODING_AES_KEY 未配置")
-        return PlainTextResponse("callback not configured", status_code=500)
+    wxcpt = _get_callback_crypt()
+    if not wxcpt:
+        return PlainTextResponse(content="success", status_code=200)
 
     try:
         body = await request.body()
 
-        # 验签 + 解密 + 解析
+        # 验签 + 解密 + 解析（全部走官方 SDK）
         callback_data = wecom_callback.parse_callback(
+            wxcpt,
             msg_signature=msg_signature,
             timestamp=timestamp,
             nonce=nonce,
             body=body,
-            token=CALLBACK_TOKEN,
-            encoding_aes_key=CALLBACK_ENCODING_AES_KEY,
-            corp_id=CORP_ID,
         )
 
         event = callback_data.get("event", "")
@@ -782,7 +789,7 @@ async def receive_callback(msg_signature: str, timestamp: str, nonce: str, reque
         # 只处理智能表格记录变更事件
         if event != "smart_sheet_change":
             logging.info(f"[回调] 非智能表格事件，跳过: event={event}")
-            return PlainTextResponse("success")
+            return PlainTextResponse("success", status_code=200)
 
         doc_id = callback_data["doc_id"]
         sheet_id = callback_data["sheet_id"]
@@ -791,7 +798,7 @@ async def receive_callback(msg_signature: str, timestamp: str, nonce: str, reque
 
         if not record_ids:
             logging.info("[回调] record_ids 为空，跳过")
-            return PlainTextResponse("success")
+            return PlainTextResponse("success", status_code=200)
 
         # 分发到对应的同步函数
         if change_type in ("update_record", "add_record"):
@@ -818,13 +825,13 @@ async def receive_callback(msg_signature: str, timestamp: str, nonce: str, reque
         else:
             logging.info(f"[回调] 未知 ChangeType，跳过: {change_type}")
 
-        return PlainTextResponse("success")
+        return PlainTextResponse("success", status_code=200)
 
     except Exception as e:
         # 即使处理失败也返回 success，避免企业微信重试
         # （重试不会修复代码bug，只会造成重复日志）
         logging.error(f"[回调] 处理失败: {e}", exc_info=True)
-        return PlainTextResponse("success")
+        return PlainTextResponse("success", status_code=200)
 
 
 # ============================================================
