@@ -450,13 +450,22 @@ def create_bulk_sheets_and_sync(corp_id: str, secret: str, operator_userid: str,
         logging.info(f"===== 阶段一：串行创建子表（{total} 张）=====")
         phase1_created = []  # 成功创建子表的任务: [(task, sheet_id), ...]
         phase1_failed = []   # 阶段一失败的任务: [(task, error), ...]
+        batch_created = []   # 本批次已创建但尚未入库的表，用于排序计算
         for i, task in enumerate(tasks, 1):
             try:
                 logging.info(f"[1-{i}/{total}] 创建子表: {task['sheet_name']}")
-                insert_index = _calc_sheet_insert_index(task["sheet_date"], task["session_type"], doc_id)
+                insert_index = _calc_sheet_insert_index(
+                    task["sheet_date"], task["session_type"], doc_id,
+                    extra_sheets=batch_created,
+                )
                 sheet_result = api_wework.add_sheet(client, token, doc_id, task["sheet_name"], index=insert_index)
                 sheet_id = sheet_result["properties"]["sheet_id"]
                 phase1_created.append((task, sheet_id))
+                # 记录到 batch_created，让后续表能看到它
+                batch_created.append({
+                    "sheet_date": task["sheet_date"],
+                    "session_type": task["session_type"],
+                })
             except Exception as e:
                 logging.error(f"[1-{i}/{total}] 创建子表失败 {task['sheet_name']}: {e}")
                 phase1_failed.append((task, str(e)))
@@ -703,7 +712,8 @@ def _normalize_sessions(raw_sessions: Optional[List], default_sessions: List[Tup
     return unique
 
 
-def _calc_sheet_insert_index(sheet_date: str, session_type: str, doc_id: str) -> int:
+def _calc_sheet_insert_index(sheet_date: str, session_type: str, doc_id: str,
+                             extra_sheets: list = None) -> int:
     """计算新工作表在文档中的插入位置（用于 add_sheet 的 index 参数）
 
     排序规则：按 (sheet_date, session_type) 升序，午市(lunch)在前、晚市(dinner)在后
@@ -714,11 +724,16 @@ def _calc_sheet_insert_index(sheet_date: str, session_type: str, doc_id: str) ->
         sheet_date:   'YYYY-MM-DD'
         session_type: 'lunch' 或 'dinner'
         doc_id:       文档 ID
+        extra_sheets: 本批次已创建但尚未入库的表，格式同 db.get_all_sheets_by_doc 返回值
+                      用于批量创建时让后续表能看到前面已创建的表
 
     返回: int，传给 add_sheet 的 index 参数
     """
     try:
         all_sheets = db.get_all_sheets_by_doc(doc_id)
+        # 合并本批次已创建但尚未入库的表
+        if extra_sheets:
+            all_sheets = all_sheets + extra_sheets
         # 按 (sheet_date, session_type) 排序，lunch=0 < dinner=1
         def _sort_key(s):
             st = 0 if s.get("session_type") == "lunch" else 1
