@@ -707,7 +707,8 @@ def _calc_sheet_insert_index(sheet_date: str, session_type: str, doc_id: str) ->
     """计算新工作表在文档中的插入位置（用于 add_sheet 的 index 参数）
 
     排序规则：按 (sheet_date, session_type) 升序，午市(lunch)在前、晚市(dinner)在后
-    模板表不参与排序，始终保持在 index=0，所以返回值 +1 跳过模板
+    模板表不参与排序，始终保持在所有普通工作表之后（即文档最底部）。
+    普通工作表 index 从 0 开始（即文档最顶部），模板表排在最后。
 
     参数:
         sheet_date:   'YYYY-MM-DD'
@@ -728,8 +729,8 @@ def _calc_sheet_insert_index(sheet_date: str, session_type: str, doc_id: str) ->
         for i, s in enumerate(sorted_sheets):
             s_order = _sort_key(s)
             if new_order < s_order:
-                return i + 1  # +1 跳过模板表（模板在 index=0）
-        return len(sorted_sheets) + 1  # 排到最后，+1 跳过模板
+                return i  # 模板表在最底部，普通工作表 index 从 0 开始（文档顶部）
+        return len(sorted_sheets)  # 排到普通工作表最后（模板表仍在更底部）
     except Exception as e:
         logging.warning(f"[排序] 计算 insert index 失败，使用默认值: {e}")
         return None  # 返回 None 则不传 index，和企业微信默认行为一致
