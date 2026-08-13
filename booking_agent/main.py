@@ -125,6 +125,12 @@ def _fields_en_to_zh(d: dict, strict: bool = False) -> dict:
 def _fields_zh_to_en(d: dict, strict: bool = False) -> dict:
     """输出层：中文字典 key → 英文 key，返回给大模型/调用方"""
     return _translate_fields_keys(d, FIELD_KEY_ZH_TO_EN, strict=strict)
+
+# ---- add_record / update_record 字段权限控制 ----
+# add_record 只允许传入这些字段（中文 key）
+ALLOWED_ADD_FIELDS_ZH = {"座位类型", "座位容量", "座位备注"}
+# update_record 禁止更新这些字段（中文 key）
+FORBIDDEN_UPDATE_FIELDS_ZH = {"座位名称", "是否已订"}
 # ===========================================
 
 app = FastAPI()
@@ -437,6 +443,14 @@ async def tool_delete_sheet(request: Request):
 async def tool_update_record(request: Request):
     """工具6：更新指定工作表中指定座位记录的字段值（订座信息）
 
+    禁止更新的字段：
+      - seat_name（座位名称不可修改，如需改名请删除后重新添加）
+      - booking_status（由系统根据订座规则自动维护）
+
+    允许更新的字段：
+      - seat_type, seat_capacity, seat_remark（座位属性）
+      - guest_name, guest_phone, guest_count, reserved_dishes, reserved_by（客人信息）
+
     自动应用订座规则：
       - guest_name/guest_phone/guest_count/reserved_dishes/reserved_by 任一非空
         → booking_status 自动设为 "已订座"
@@ -457,10 +471,10 @@ async def tool_update_record(request: Request):
     参数说明：
       - date:    日期（YYYY-MM-DD / MM-DD）
       - session: 场次（lunch/dinner/午市/晚市）
-      - seat_name: 座位名称（如"北京房"）
-      - fields:  要更新的字段字典，支持的英文 key：
-                 seat_name, seat_capacity, seat_remark, guest_name, guest_phone,
-                 guest_count, reserved_dishes, reserved_by, seat_type, booking_status
+      - seat_name: 座位名称（如"北京房"，用于定位记录，不可修改）
+      - fields:  要更新的字段字典，允许的英文 key：
+                 seat_type, seat_capacity, seat_remark,
+                 guest_name, guest_phone, guest_count, reserved_dishes, reserved_by
     """
     try:
         body = await request.json()
@@ -485,6 +499,16 @@ async def tool_update_record(request: Request):
             fields_zh = _fields_en_to_zh(fields_en, strict=True)
         except ValueError as ve:
             return {"content": f"❌ 参数错误：{str(ve)}"}
+
+        # 黑名单校验：禁止更新座位名称和是否已订
+        forbidden_zh = set(fields_zh.keys()) & FORBIDDEN_UPDATE_FIELDS_ZH
+        if forbidden_zh:
+            forbidden_en = sorted(FIELD_KEY_ZH_TO_EN.get(k, k) for k in forbidden_zh)
+            return {"content": (
+                f"❌ 参数错误：update_record 不允许更新以下字段：{forbidden_en}。"
+                f"座位名称不可修改（如需改名请删除后重新添加），"
+                f"是否已订由系统自动维护。"
+            )}
 
         result = update_record_and_sync(
             CORP_ID, SECRET, operator_userid, operator_name,
@@ -525,32 +549,33 @@ async def tool_update_record(request: Request):
 
 @app.post("/add_record")
 async def tool_add_record(request: Request):
-    """工具7：向指定工作表添加一条新记录
+    """工具7：向指定工作表添加一条新记录（只负责建空座位，不填客人信息）
 
-    默认值：
-      - seat_name = 传入的 seat_name
-      - seat_type = "大厅"
-      - booking_status = "未订座"（自动按订座规则计算）
-      - 其余字段 = 空
+    允许传入的 fields：
+      - seat_type（可选，默认"大厅"）
+      - seat_capacity（可选，默认空）
+      - seat_remark（可选，默认空）
 
-    订座规则（自动应用）：
-      - guest_name/guest_phone/guest_count/reserved_dishes/reserved_by 任一非空
-        → booking_status = "已订座"
-      - 全部为空 → booking_status = "未订座"
+    禁止传入的 fields（客人信息请通过 update_record 工具填写）：
+      - guest_name, guest_phone, guest_count, reserved_dishes, reserved_by, booking_status
+
+    自动设置：
+      - seat_name = 传入的 seat_name（必填）
+      - seat_type = 用户传入值或"大厅"
+      - booking_status = "未订座"（客人信息全空，自动计算）
 
     请求 Body（JSON）示例：
       - 添加空白座位（全部默认值）：
         {"date": "2026-09-26", "session": "dinner", "seat_name": "临时桌A",
          "operator_userid": "xxx", "operator_name": "yyy"}
 
-      - 添加并填写客人信息：
-        {"date": "2026-09-26", "session": "dinner", "seat_name": "临时桌B",
-         "fields": {"guest_name": "王五", "guest_phone": "13900000000", "guest_count": "4", "seat_type": "房间"},
+      - 指定座位类型和容量：
+        {"date": "2026-09-26", "session": "dinner", "seat_name": "VIP1",
+         "fields": {"seat_type": "房间", "seat_capacity": "10", "seat_remark": "靠窗"},
          "operator_userid": "xxx", "operator_name": "yyy"}
 
-    fields 支持的英文 key：
-      seat_name, seat_capacity, seat_remark, guest_name, guest_phone,
-      guest_count, reserved_dishes, reserved_by, seat_type, booking_status
+    fields 允许的英文 key：
+      seat_type, seat_capacity, seat_remark
     """
     try:
         body = await request.json()
@@ -573,6 +598,17 @@ async def tool_add_record(request: Request):
             fields_zh = _fields_en_to_zh(fields_en, strict=True)
         except ValueError as ve:
             return {"content": f"❌ 参数错误：{str(ve)}"}
+
+        # 白名单校验：add_record 只允许传入座位属性字段，客人信息请用 update_record
+        forbidden_zh = set(fields_zh.keys()) - ALLOWED_ADD_FIELDS_ZH
+        if forbidden_zh:
+            forbidden_en = sorted(FIELD_KEY_ZH_TO_EN.get(k, k) for k in forbidden_zh)
+            allowed_en = sorted(FIELD_KEY_ZH_TO_EN.get(k, k) for k in ALLOWED_ADD_FIELDS_ZH)
+            return {"content": (
+                f"❌ 参数错误：add_record 不允许传入以下字段：{forbidden_en}。"
+                f"只允许传 {allowed_en}。"
+                f"客人信息请通过 update_record 工具填写。"
+            )}
 
         result = add_record_and_sync(
             CORP_ID, SECRET, operator_userid, operator_name,
