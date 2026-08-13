@@ -1354,6 +1354,17 @@ def add_record_and_sync(
         if unknown_fields:
             raise ValueError(f"以下字段不存在于工作表中：{unknown_fields}")
 
+        # ---------- 步骤 4.5：座位名称重复校验 ----------
+        target_seat_name = final_fields.get("座位名称", "")
+        if target_seat_name:
+            existing_records = api_wework.get_records(client, token, doc_id, sheet_id)
+            for rec in existing_records.get("records", []):
+                existing_seat = _extract_text_value(rec.get("values", {}).get("座位名称"))
+                if existing_seat and existing_seat == target_seat_name:
+                    raise ValueError(
+                        f"座位名称重复：'{target_seat_name}' 已在工作表 {sheet_name} 中存在，不能重复添加"
+                    )
+
         # 构造记录：只填 final_fields 中的字段，其余字段由企业微信默认为空
         record_values = {}
         for field_title, value in final_fields.items():
@@ -2161,6 +2172,40 @@ def sync_remote_record_change(
                     f"[回调同步] 修正订座状态：{sheet_name} / {seat_name} "
                     f"{current_status} → {expected_status}"
                 )
+
+        # ---------- 步骤 2.5：座位名称重复检测 + 标记 ----------
+        # 人工可能把座位名称改成和另一条记录同名，检测到后标记为"座位名称重复(原xxx)"
+        seat_name_field_type = field_map.get("座位名称", {}).get("field_type", "FIELD_TYPE_TEXT")
+        seat_name_counts = {}  # {seat_name: [record_id, ...]}
+        for rec in all_records:
+            sname = _extract_text_value(rec.get("values", {}).get("座位名称", []))
+            if sname:
+                seat_name_counts.setdefault(sname, []).append(rec.get("record_id"))
+
+        # 只检查回调涉及的 record_ids
+        callback_rid_set = set(record_ids)
+        for sname, rids in seat_name_counts.items():
+            if len(rids) > 1:
+                # 有重复，只标记回调涉及的那条（人工刚改的那条）
+                for dup_rid in rids:
+                    if dup_rid in callback_rid_set:
+                        marked_name = f"座位名称重复(原{sname})"
+                        seat_field_type = field_map.get("座位名称", {}).get("field_type", "FIELD_TYPE_TEXT")
+                        api_wework.update_records(
+                            client, token, local_doc_id, sheet_id,
+                            [{"record_id": dup_rid, "values": {
+                                "座位名称": _build_update_value(seat_field_type, marked_name)
+                            }}]
+                        )
+                        corrections.append({
+                            "record_id": dup_rid,
+                            "seat_name": sname,
+                            "marked_name": marked_name,
+                            "reason": "座位名称重复，自动标记",
+                        })
+                        logging.warning(
+                            f"[回调同步] 座位名称重复标记：{sheet_name} / {sname} → {marked_name}"
+                        )
 
     # ---------- 步骤 4：写操作日志 ----------
     user_id = db.insert_user(operator_userid, operator_userid)
