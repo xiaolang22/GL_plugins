@@ -453,7 +453,8 @@ def create_bulk_sheets_and_sync(corp_id: str, secret: str, operator_userid: str,
         for i, task in enumerate(tasks, 1):
             try:
                 logging.info(f"[1-{i}/{total}] 创建子表: {task['sheet_name']}")
-                sheet_result = api_wework.add_sheet(client, token, doc_id, task["sheet_name"])
+                insert_index = _calc_sheet_insert_index(task["sheet_date"], task["session_type"], doc_id)
+                sheet_result = api_wework.add_sheet(client, token, doc_id, task["sheet_name"], index=insert_index)
                 sheet_id = sheet_result["properties"]["sheet_id"]
                 phase1_created.append((task, sheet_id))
             except Exception as e:
@@ -702,6 +703,38 @@ def _normalize_sessions(raw_sessions: Optional[List], default_sessions: List[Tup
     return unique
 
 
+def _calc_sheet_insert_index(sheet_date: str, session_type: str, doc_id: str) -> int:
+    """计算新工作表在文档中的插入位置（用于 add_sheet 的 index 参数）
+
+    排序规则：按 (sheet_date, session_type) 升序，午市(lunch)在前、晚市(dinner)在后
+    模板表不参与排序，始终保持在 index=0，所以返回值 +1 跳过模板
+
+    参数:
+        sheet_date:   'YYYY-MM-DD'
+        session_type: 'lunch' 或 'dinner'
+        doc_id:       文档 ID
+
+    返回: int，传给 add_sheet 的 index 参数
+    """
+    try:
+        all_sheets = db.get_all_sheets_by_doc(doc_id)
+        # 按 (sheet_date, session_type) 排序，lunch=0 < dinner=1
+        def _sort_key(s):
+            st = 0 if s.get("session_type") == "lunch" else 1
+            return (s.get("sheet_date", ""), st)
+        sorted_sheets = sorted(all_sheets, key=_sort_key)
+
+        new_order = (sheet_date, 0 if session_type == "lunch" else 1)
+        for i, s in enumerate(sorted_sheets):
+            s_order = _sort_key(s)
+            if new_order < s_order:
+                return i + 1  # +1 跳过模板表（模板在 index=0）
+        return len(sorted_sheets) + 1  # 排到最后，+1 跳过模板
+    except Exception as e:
+        logging.warning(f"[排序] 计算 insert index 失败，使用默认值: {e}")
+        return None  # 返回 None 则不传 index，和企业微信默认行为一致
+
+
 def create_any_sheet_and_sync(
     corp_id: str,
     secret: str,
@@ -785,8 +818,9 @@ def create_any_sheet_and_sync(
         token = api_wework.get_access_token(client, corp_id, secret)
 
         for (session_type, session_label), sheet_name in zip(normalized_sessions, planned_names):
-            # 1a. 创建子表
-            add_result = api_wework.add_sheet(client, token, doc_id, sheet_name)
+            # 1a. 创建子表（按日期计算插入位置，保证工作表按时间排序）
+            insert_index = _calc_sheet_insert_index(date_iso, session_type, doc_id)
+            add_result = api_wework.add_sheet(client, token, doc_id, sheet_name, index=insert_index)
             sheet_id = add_result["properties"]["sheet_id"]
 
             # 1b. 复用填充函数：字段/记录/分组规则
@@ -1728,8 +1762,9 @@ def _supplement_new_sheets(
                 continue  # 已存在就跳过（理论上不会，因为是 buffer_max_date 之后）
 
             try:
-                # 阶段一：创建子表
-                add_result = api_wework.add_sheet(client, token, doc_id, sheet_name)
+                # 阶段一：创建子表（按日期计算插入位置，保证工作表按时间排序）
+                insert_index = _calc_sheet_insert_index(current.isoformat(), session_type, doc_id)
+                add_result = api_wework.add_sheet(client, token, doc_id, sheet_name, index=insert_index)
                 sheet_id = add_result["properties"]["sheet_id"]
 
                 # 阶段二：填充（单张，直接调用）

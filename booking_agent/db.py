@@ -327,6 +327,22 @@ def get_sheet_by_date_and_session(sheet_date: str, session_type: str, doc_id: st
     return dict(row) if row else None
 
 
+def get_all_sheets_by_doc(doc_id: str) -> list:
+    """查询指定文档下所有普通工作表（不含模板），用于排序计算
+    返回 [{id, sheet_id, sheet_name, sheet_date, session_type}, ...]
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        'SELECT id, sheet_id, sheet_name, sheet_date, session_type '
+        'FROM sheets WHERE doc_id = ?',
+        (doc_id,)
+    )
+    rows = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+    return rows
+
+
 def delete_sheet_by_id(sheet_id: str) -> int:
     """按 sheet_id 删除工作表记录，返回被删除的行数"""
     conn = get_connection()
