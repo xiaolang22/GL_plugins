@@ -1725,9 +1725,9 @@ def _supplement_new_sheets(
     days: int,
 ) -> Dict[str, Any]:
     """补足 buffer 范围内的新工作表
-    - 从 max(buffer_max_date + 1 day, today) 开始创建，直到 buffer_end
+    - 从 today 开始遍历到 buffer_end，逐天逐场检查是否缺失，缺失就补
     - 创建前检查 255 限额，超过则截断
-    - 只补新表，不补中间缺表（buffer 内用户手动删除的表不自动补）
+    - 补新表 + 补缺场（同一天只有午市缺晚市的情况也会补上）
     - 串行创建（保持顺序，量一般不大）
     返回 {created, skipped_due_to_limit, start_date, end_date}
     """
@@ -1735,27 +1735,17 @@ def _supplement_new_sheets(
     if not template_content:
         raise Exception("模板内容为空，无法补足工作表")
 
-    # 计算 buffer_end
-    # buffer_end 已经由主流程算出并用于标记 is_buffer
-    # 这里通过 db.get_buffer_max_date 获取当前实际上界
-    buffer_max_date_str = db.get_buffer_max_date()
-    if buffer_max_date_str:
-        buffer_max_date = date.fromisoformat(buffer_max_date_str)
-    else:
-        # 没有任何 buffer 记录时，从今天开始补
-        buffer_max_date = today - timedelta(days=1)
-
-    # 起始补表日期：buffer_max_date 的下一天，但不能早于今天（今天和未来才需要补）
-    start_supplement = max(buffer_max_date + timedelta(days=1), today)
-
     # buffer_end：和批量创建一致（today ~ today + days - 1）
     _buf_start, buffer_end = _calc_buffer_range(days, today)
+
+    # 起始补表日期：从今天开始（今天和未来才需要补）
+    start_supplement = today
 
     created = []
     skipped_due_to_limit = []
     running_total = current_total
 
-    # 遍历从 start_supplement 到 buffer_end（含）
+    # 遍历从 start_supplement 到 buffer_end（含），逐天逐场检查是否缺失
     current = start_supplement
     while current <= buffer_end:
         weekday_name = WEEKDAYS[current.weekday()]
@@ -1773,9 +1763,9 @@ def _supplement_new_sheets(
                 continue
 
             sheet_name = f"{current.month}-{current.day}{session_label}{weekday_name}"
-            # 查重（本地 DB）
-            if db.sheet_name_exists(sheet_name):
-                continue  # 已存在就跳过（理论上不会，因为是 buffer_max_date 之后）
+            # 查重（本地 DB）：按日期+场次精确检查，已存在就跳过
+            if db.get_sheet_by_date_and_session(current.isoformat(), session_type, doc_id):
+                continue
 
             try:
                 # 阶段一：创建子表（按日期计算插入位置，保证工作表按时间排序）
