@@ -7,7 +7,7 @@ from pydantic import BaseModel
 import uvicorn
 
 PRINTER_IP = "127.0.0.1"
-PRINTER_PORT = 9100  # ESC/POS 默认端口
+PRINTER_PORT = 9101  # ESC/POS 默认端口
 
 # 常用 ESC/POS 指令
 INIT = b"\x1b\x40"           # 初始化打印机
