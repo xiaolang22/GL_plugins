@@ -42,20 +42,27 @@ SIZE_MAP = {
 
 ALIGN_CMD = {"left": ALIGN_L, "center": ALIGN_C, "right": ALIGN_R}
 
-# 每行打印后复位所有样式，避免污染下一行
-RESET_STYLE = BOLD_OFF + UNDERLINE_OFF + REVERSE_OFF + b"\x1d\x21\x00"  # +复位字号
+LINE_SPACING_DEFAULT = b"\x1b\x32"  # 恢复默认行距 ESC 2
+
+# 每行打印后复位所有样式(含行距)，避免污染下一行
+RESET_STYLE = (
+    BOLD_OFF + UNDERLINE_OFF + REVERSE_OFF
+    + b"\x1d\x21\x00"   # 复位字号
+    + LINE_SPACING_DEFAULT  # 复位行距
+)
 
 
 # ---------- 行解析与指令拼装 ----------
 
 def _parse_line(raw: str) -> tuple:
-    """解析 '文本|center,bold' → ('文本', style_dict)"""
+    """解析 '文本|center,bold,spacing:30' → ('文本', style_dict)"""
     style = {
         "align": "left",
         "size": "normal",
         "bold": False,
         "underline": False,
         "reverse": False,
+        "spacing": None,   # None 表示用默认行距, 不发指令; 整数则发 ESC 3 n
     }
     if "|" in raw:
         text, desc = raw.split("|", 1)
@@ -73,6 +80,14 @@ def _parse_line(raw: str) -> tuple:
                 style["underline"] = True
             elif token == "reverse":
                 style["reverse"] = True
+            elif token.startswith("spacing:"):
+                # spacing:N  N∈[0,255] 单位 1/216 英寸
+                try:
+                    n = int(token.split(":", 1)[1])
+                    if 0 <= n <= 255:
+                        style["spacing"] = n
+                except ValueError:
+                    pass  # 非法值静默忽略
             # 未识别 token 静默忽略
     else:
         text = raw
@@ -86,8 +101,11 @@ def _line_cmd(text: str, style: dict) -> bytes:
     cmd += BOLD_ON if style["bold"] else BOLD_OFF
     cmd += UNDERLINE_ON if style["underline"] else UNDERLINE_OFF
     cmd += REVERSE_ON if style["reverse"] else REVERSE_OFF
+    # 行距: 仅当显式指定时设置 (ESC 3 n), 不指定则保留打印机当前默认
+    if style["spacing"] is not None:
+        cmd += bytes([0x1b, 0x33, style["spacing"]])
     cmd += text.encode("gbk", errors="replace")  # 不可编码字符替换为 ?，避免整次打印失败
-    cmd += RESET_STYLE  # 复位所有样式
+    cmd += RESET_STYLE  # 复位所有样式(含行距)
     cmd += LF
     return cmd
 
