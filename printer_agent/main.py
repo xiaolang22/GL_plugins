@@ -105,8 +105,8 @@ def _line_cmd(text: str, style: dict) -> bytes:
     if style["spacing"] is not None:
         cmd += bytes([0x1b, 0x33, style["spacing"]])
     cmd += text.encode("gbk", errors="replace")  # 不可编码字符替换为 ?，避免整次打印失败
-    cmd += RESET_STYLE  # 复位所有样式(含行距)
-    cmd += LF
+    cmd += LF           # 先按设置的行距换行(LF 时 ESC 3 n 才生效)
+    cmd += RESET_STYLE  # 换行后再复位样式(含行距), 避免污染下一行
     return cmd
 
 
