@@ -36,9 +36,9 @@ def print_lines(lines: List[str]) -> int:
     sock = _connect()
     total_bytes = 0
     try:
-        # 1. 先切纸（清理上次残留）
-        sock.sendall(CUT)
-        total_bytes += len(CUT)
+        # # 1. 先切纸（清理上次残留）
+        # sock.sendall(CUT)
+        # total_bytes += len(CUT)
         # 2. 初始化
         sock.sendall(INIT)
         total_bytes += len(INIT)
