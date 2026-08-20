@@ -86,7 +86,7 @@ def _line_cmd(text: str, style: dict) -> bytes:
     cmd += BOLD_ON if style["bold"] else BOLD_OFF
     cmd += UNDERLINE_ON if style["underline"] else UNDERLINE_OFF
     cmd += REVERSE_ON if style["reverse"] else REVERSE_OFF
-    cmd += text.encode("gbk")
+    cmd += text.encode("gbk", errors="replace")  # 不可编码字符替换为 ?，避免整次打印失败
     cmd += RESET_STYLE  # 复位所有样式
     cmd += LF
     return cmd
