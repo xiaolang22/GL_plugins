@@ -98,6 +98,50 @@ SEAT_DATA = [
     ("38号桌", 4, "窗边", "大厅"),
 ]
 
+# ==================== 模板内容（集中维护，便于人工调整） ====================
+# 顺序要求：座位名称、客人称呼、客人电话、人数、留菜、留位人、是否已订、座位类型、座位容量、座位备注
+TEMPLATE_FIELDS = [
+    {"field_title": "座位名称", "field_type": "FIELD_TYPE_TEXT"},
+    {"field_title": "客人称呼", "field_type": "FIELD_TYPE_TEXT"},
+    {"field_title": "客人电话", "field_type": "FIELD_TYPE_TEXT"},
+    {"field_title": "人数", "field_type": "FIELD_TYPE_TEXT"},
+    {"field_title": "留菜", "field_type": "FIELD_TYPE_TEXT"},
+    {"field_title": "留位人", "field_type": "FIELD_TYPE_TEXT"},
+    {"field_title": "是否已订", "field_type": "FIELD_TYPE_SINGLE_SELECT", "options": ["已订座", "未订座"]},
+    {"field_title": "座位类型", "field_type": "FIELD_TYPE_SINGLE_SELECT", "options": ["房间", "大厅"]},
+    {"field_title": "座位容量", "field_type": "FIELD_TYPE_TEXT"},
+    {"field_title": "座位备注", "field_type": "FIELD_TYPE_TEXT"},
+]
+
+TEMPLATE_RECORDS = []
+for name, capacity, remark, seat_type in SEAT_DATA:
+    TEMPLATE_RECORDS.append({
+        "座位名称": name,
+        "客人称呼": "",
+        "客人电话": "",
+        "人数": "",
+        "留菜": "",
+        "留位人": "",
+        "是否已订": "未订座",
+        "座位类型": seat_type,
+        "座位容量": str(capacity),
+        "座位备注": remark,
+    })
+
+TEMPLATE_GROUP_SPEC = {
+    "groups": [
+        {"field_title": "是否已订", "desc": False},
+        {"field_title": "座位类型", "desc": False},
+    ]
+}
+
+TEMPLATE_CONTENT = {
+    "fields": TEMPLATE_FIELDS,
+    "records": TEMPLATE_RECORDS,
+    "group_spec": TEMPLATE_GROUP_SPEC,
+}
+# ========================================================================
+
 def create_smart_sheet_and_sync(corp_id: str, secret: str, doc_name: str, admin_users: List[str], operator_userid: str, operator_name: str) -> Dict[str, Any]:
     """
     复合操作1：创建智能表格并同步到数据库
@@ -153,16 +197,17 @@ def create_template_sheet_and_sync(corp_id: str, secret: str, template_name: str
                 "field_type": "FIELD_TYPE_TEXT"
             }])
 
-        # 2. 添加剩余 9 个字段（"座位名称"已通过重命名默认字段获得，保持第一列）
-        # 需求从左到右顺序：座位名称(已有)、座位容量、座位备注、客人称呼、客人电话、人数、留菜、留位人、座位类型、是否已订
+        # 2. 添加剩余字段（"座位名称"已通过重命名默认字段获得，保持第一列）
+        # 需求从左到右顺序：座位名称、客人称呼、客人电话、人数、留菜、留位人、是否已订、座位类型、座位容量、座位备注
         # 注意：add_fields 会将新字段**前置插入**（插入到最左侧），因此需要按逆序传入，才能得到正确从左到右顺序
         fields = [
             {
-                "field_title": "是否已订",
-                "field_type": "FIELD_TYPE_SINGLE_SELECT",
-                "property_single_select": {
-                    "options": [{"text": "已订座"}, {"text": "未订座"}]
-                }
+                "field_title": "座位备注",
+                "field_type": "FIELD_TYPE_TEXT"
+            },
+            {
+                "field_title": "座位容量",
+                "field_type": "FIELD_TYPE_TEXT"
             },
             {
                 "field_title": "座位类型",
@@ -171,13 +216,18 @@ def create_template_sheet_and_sync(corp_id: str, secret: str, template_name: str
                     "options": [{"text": "房间"}, {"text": "大厅"}]
                 }
             },
+            {
+                "field_title": "是否已订",
+                "field_type": "FIELD_TYPE_SINGLE_SELECT",
+                "property_single_select": {
+                    "options": [{"text": "已订座"}, {"text": "未订座"}]
+                }
+            },
             {"field_title": "留位人", "field_type": "FIELD_TYPE_TEXT"},
             {"field_title": "留菜", "field_type": "FIELD_TYPE_TEXT"},
             {"field_title": "人数", "field_type": "FIELD_TYPE_TEXT"},
             {"field_title": "客人电话", "field_type": "FIELD_TYPE_TEXT"},
             {"field_title": "客人称呼", "field_type": "FIELD_TYPE_TEXT"},
-            {"field_title": "座位备注", "field_type": "FIELD_TYPE_TEXT"},
-            {"field_title": "座位容量", "field_type": "FIELD_TYPE_TEXT"},
         ]
         api_wework.add_fields(client, token, doc_id, sheet_id, fields)
 
@@ -194,10 +244,15 @@ def create_template_sheet_and_sync(corp_id: str, secret: str, template_name: str
             records.append({
                 "values": {
                     "座位名称": text_value(name),
+                    "客人称呼": text_value(""),
+                    "客人电话": text_value(""),
+                    "人数": text_value(""),
+                    "留菜": text_value(""),
+                    "留位人": text_value(""),
+                    "是否已订": select_value("未订座"),
+                    "座位类型": select_value(seat_type),
                     "座位容量": text_value(capacity),
                     "座位备注": text_value(remark),
-                    "座位类型": select_value(seat_type),
-                    "是否已订": select_value("未订座")
                 }
             })
         api_wework.add_records(client, token, doc_id, sheet_id, records)
@@ -222,49 +277,27 @@ def create_template_sheet_and_sync(corp_id: str, secret: str, template_name: str
                 }
             })
 
-    # 5. 构造模板内容 JSON（与实际创建的模板结构一致，便于后续复用）
-    # 5.1 字段定义（按从左到右顺序）
-    template_fields = [
-        {"field_title": "座位名称", "field_type": "FIELD_TYPE_TEXT"},
-        {"field_title": "座位容量", "field_type": "FIELD_TYPE_TEXT"},
-        {"field_title": "座位备注", "field_type": "FIELD_TYPE_TEXT"},
-        {"field_title": "客人称呼", "field_type": "FIELD_TYPE_TEXT"},
-        {"field_title": "客人电话", "field_type": "FIELD_TYPE_TEXT"},
-        {"field_title": "人数", "field_type": "FIELD_TYPE_TEXT"},
-        {"field_title": "留菜", "field_type": "FIELD_TYPE_TEXT"},
-        {"field_title": "留位人", "field_type": "FIELD_TYPE_TEXT"},
-        {"field_title": "座位类型", "field_type": "FIELD_TYPE_SINGLE_SELECT", "options": ["房间", "大厅"]},
-        {"field_title": "是否已订", "field_type": "FIELD_TYPE_SINGLE_SELECT", "options": ["已订座", "未订座"]},
+    # 5. 构造模板内容 JSON（复用顶部统一模板定义，便于人工调整）
+    template_fields = list(TEMPLATE_FIELDS)
+    template_records = [
+        {
+            "座位名称": record["座位名称"],
+            "客人称呼": record["客人称呼"],
+            "客人电话": record["客人电话"],
+            "人数": record["人数"],
+            "留菜": record["留菜"],
+            "留位人": record["留位人"],
+            "是否已订": record["是否已订"],
+            "座位类型": record["座位类型"],
+            "座位容量": record["座位容量"],
+            "座位备注": record["座位备注"],
+        }
+        for record in TEMPLATE_RECORDS
     ]
-
-    # 5.2 记录数据（使用可读格式，而非 API 特定的 value 封装格式）
-    template_records = []
-    for name, capacity, remark, seat_type in SEAT_DATA:
-        template_records.append({
-            "座位名称": name,
-            "座位容量": str(capacity),
-            "座位备注": remark,
-            "客人称呼": "",
-            "客人电话": "",
-            "人数": "",
-            "留菜": "",
-            "留位人": "",
-            "座位类型": seat_type,
-            "是否已订": "未订座"
-        })
-
-    # 5.3 分组规则（使用字段标题而非动态 field_id，便于跨实例复用）
-    template_group_spec = {
-        "groups": [
-            {"field_title": "是否已订", "desc": False},
-            {"field_title": "座位类型", "desc": False}
-        ]
-    }
-
     template_content = {
         "fields": template_fields,
         "records": template_records,
-        "group_spec": template_group_spec
+        "group_spec": TEMPLATE_GROUP_SPEC,
     }
 
     # 6. 同步数据库：插入模板记录（含 template_content）
