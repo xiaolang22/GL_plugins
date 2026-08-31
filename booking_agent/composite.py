@@ -451,6 +451,7 @@ def sync_template_content_from_remote(
 
     existing_snapshot = template.get("template_content") or {}
     if existing_snapshot == remote_snapshot:
+        logging.info(f"[模板同步] 模板内容未变更，跳过写库：template_id={template_id}, sheet_id={sheet_id}")
         return {
             "template_id": template_id,
             "sheet_id": sheet_id,
@@ -460,6 +461,7 @@ def sync_template_content_from_remote(
         }
 
     db.update_template_content(template_id, remote_snapshot)
+    logging.info(f"[模板同步] 模板内容已落库：template_id={template_id}, sheet_id={sheet_id}, updated=True")
 
     if operator_userid:
         user_id = db.insert_user(operator_userid, operator_name or operator_userid)
@@ -2274,14 +2276,41 @@ def sync_remote_record_change(
     if default_sessions is None:
         default_sessions = [("lunch", "午市"), ("dinner", "晚市")]
 
-    # ---------- 步骤 0：查本地 sheets 表定位工作表 ----------
+    # ---------- 步骤 0：模板工作表单独处理 ----------
+    if db.is_template_sheet(sheet_id):
+        logging.info(f"[回调同步] 检测到模板工作表变更，执行模板快照同步：{sheet_id}")
+        try:
+            result = sync_template_content_from_remote(
+                corp_id=corp_id,
+                secret=secret,
+                sheet_id=sheet_id,
+                operator_userid=operator_userid,
+                operator_name=operator_userid,
+            )
+            return {
+                "sheet_id": sheet_id,
+                "change_type": change_type,
+                "updated": bool(result.get("updated")),
+                "template_synced": True,
+                "skipped": False,
+                "detail": result,
+            }
+        except Exception as e:
+            logging.error(f"[回调同步] 模板同步失败：{sheet_id}, error={e}", exc_info=True)
+            return {
+                "sheet_id": sheet_id,
+                "change_type": change_type,
+                "updated": False,
+                "template_synced": False,
+                "skipped": False,
+                "error": str(e),
+            }
+
+    # ---------- 步骤 0：查本地 sheets 表定位普通工作表 ----------
     sheet_row = db.get_sheet_by_id(sheet_id)
     if not sheet_row:
-        if db.is_template_sheet(sheet_id):
-            logging.info(f"[回调同步] 跳过模板工作表：{sheet_id}")
-        else:
-            logging.warning(f"[回调同步] 工作表不在本地数据库中：{sheet_id}")
-        return {"skipped": True, "reason": "sheet not in local DB or is template"}
+        logging.warning(f"[回调同步] 工作表不在本地数据库中：{sheet_id}")
+        return {"skipped": True, "reason": "sheet not in local DB"}
 
     sheet_name = sheet_row["sheet_name"]
     local_doc_id = sheet_row["doc_id"]
@@ -2474,14 +2503,41 @@ def sync_remote_record_delete(
     if default_sessions is None:
         default_sessions = [("lunch", "午市"), ("dinner", "晚市")]
 
-    # ---------- 步骤 0：查本地 sheets 表定位工作表 ----------
+    # ---------- 步骤 0：模板工作表单独处理 ----------
+    if db.is_template_sheet(sheet_id):
+        logging.info(f"[回调同步] 检测到模板工作表删除事件，执行模板快照同步：{sheet_id}")
+        try:
+            result = sync_template_content_from_remote(
+                corp_id=corp_id,
+                secret=secret,
+                sheet_id=sheet_id,
+                operator_userid=operator_userid,
+                operator_name=operator_userid,
+            )
+            return {
+                "sheet_id": sheet_id,
+                "deleted_record_ids": record_ids,
+                "template_synced": True,
+                "updated": bool(result.get("updated")),
+                "skipped": False,
+                "detail": result,
+            }
+        except Exception as e:
+            logging.error(f"[回调同步] 模板同步失败：{sheet_id}, error={e}", exc_info=True)
+            return {
+                "sheet_id": sheet_id,
+                "deleted_record_ids": record_ids,
+                "template_synced": False,
+                "updated": False,
+                "skipped": False,
+                "error": str(e),
+            }
+
+    # ---------- 步骤 0：查本地 sheets 表定位普通工作表 ----------
     sheet_row = db.get_sheet_by_id(sheet_id)
     if not sheet_row:
-        if db.is_template_sheet(sheet_id):
-            logging.info(f"[回调同步] 跳过模板工作表：{sheet_id}")
-        else:
-            logging.warning(f"[回调同步] 工作表不在本地数据库中：{sheet_id}")
-        return {"skipped": True, "reason": "sheet not in local DB or is template"}
+        logging.warning(f"[回调同步] 工作表不在本地数据库中：{sheet_id}")
+        return {"skipped": True, "reason": "sheet not in local DB"}
 
     sheet_name = sheet_row["sheet_name"]
 
