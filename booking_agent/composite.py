@@ -303,6 +303,19 @@ def create_template_sheet_and_sync(corp_id: str, secret: str, template_name: str
     # 6. 同步数据库：插入模板记录（含 template_content）
     template_db_id = db.insert_template(doc_id, sheet_id, template_name, operator_userid, template_content)
 
+    # 6.5：补充内部同步兜底：模板初始入库时即按当前远端实际状态做一次快照写入
+    # 这保证模板内容与远端工作表状态一致，并保留 group_spec 作为同步的一部分
+    try:
+        sync_template_content_from_remote(
+            corp_id=corp_id,
+            secret=secret,
+            template_id=template_db_id,
+            operator_userid=operator_userid,
+            operator_name=operator_name,
+        )
+    except Exception as e:
+        logging.warning(f"模板初始化同步快照失败（不影响模板创建）：{e}")
+
     # 7. 日志
     user_id = db.insert_user(operator_userid, operator_name)
     db.insert_log(
@@ -314,6 +327,162 @@ def create_template_sheet_and_sync(corp_id: str, secret: str, template_name: str
     )
 
     return {"sheet_id": sheet_id, "template_db_id": template_db_id}
+
+
+def _normalize_remote_field(field: Dict[str, Any]) -> Dict[str, Any]:
+    """把企业微信字段结构规范化为统一的 template_content 字段格式"""
+    field_type = field.get("field_type") or "FIELD_TYPE_TEXT"
+    normalized = {
+        "field_title": field.get("field_title") or field.get("title") or "",
+        "field_type": field_type,
+    }
+    if field_type == "FIELD_TYPE_SINGLE_SELECT":
+        options = field.get("property_single_select", {}).get("options", [])
+        normalized["options"] = [
+            opt.get("text") for opt in options if isinstance(opt, dict) and opt.get("text") is not None
+        ]
+    return normalized
+
+
+def _normalize_remote_record(record: Dict[str, Any]) -> Dict[str, Any]:
+    """把企业微信 record 的 values 结构转换成普通字典"""
+    values = record.get("values", {}) or {}
+    result: Dict[str, Any] = {}
+    for key, payload in values.items():
+        if not payload:
+            result[key] = ""
+            continue
+        if isinstance(payload, list):
+            text_value = ""
+            for item in payload:
+                if isinstance(item, dict):
+                    if item.get("text") is not None:
+                        text_value = str(item.get("text"))
+                        break
+                    if item.get("type") == "text" and item.get("text") is not None:
+                        text_value = str(item.get("text"))
+                        break
+            result[key] = text_value
+        else:
+            result[key] = str(payload)
+    return result
+
+
+def _read_remote_template_snapshot(client: httpx.Client, token: str, doc_id: str, sheet_id: str) -> Dict[str, Any]:
+    """读取远端模板工作表快照：字段 + 记录 + 分组规则。"""
+    fields_resp = api_wework.get_fields(client, token, doc_id, sheet_id)
+    fields = fields_resp.get("fields", [])
+
+    records_resp = api_wework.get_records(client, token, doc_id, sheet_id, limit=100)
+    records = records_resp.get("records", [])
+    total = records_resp.get("total", len(records))
+    next_offset = records_resp.get("next_offset")
+    while next_offset and next_offset < total:
+        more_resp = api_wework.get_records(client, token, doc_id, sheet_id, offset=next_offset, limit=100)
+        records.extend(more_resp.get("records", []))
+        next_offset = more_resp.get("next_offset")
+
+    field_map = {f.get("field_id"): f.get("field_title") for f in fields if f.get("field_id")}
+    views_resp = api_wework.get_views(client, token, doc_id, sheet_id)
+    groups = []
+    for view in views_resp.get("views", []):
+        view_property = view.get("property") or {}
+        group_spec = view_property.get("group_spec") or {}
+        for item in group_spec.get("groups", []):
+            field_id = item.get("field_id")
+            field_title = field_map.get(field_id)
+            if field_title:
+                groups.append({
+                    "field_title": field_title,
+                    "desc": bool(item.get("desc", False)),
+                })
+        if groups:
+            break
+
+    normalized_fields = [_normalize_remote_field(f) for f in fields]
+    normalized_records = [_normalize_remote_record(rec) for rec in records]
+
+    return {
+        "fields": normalized_fields,
+        "records": normalized_records,
+        "group_spec": {"groups": groups},
+    }
+
+
+def sync_template_content_from_remote(
+    corp_id: str,
+    secret: str,
+    template_id: int = None,
+    sheet_id: str = None,
+    operator_userid: str = None,
+    operator_name: str = None,
+) -> Dict[str, Any]:
+    """同步模板工作表远端内容到数据库，包含字段/记录/分组规则变化。
+
+    规则：
+      - 只比较模板真实内容，不忽略分组规则；若远端分组配置变更，也同步写入数据库
+      - 只有内容真实发生变化时才更新数据库
+      - 本函数是内部自动化工具，不暴露给外部调用方
+    """
+    if template_id is None and sheet_id is None:
+        template = db.get_first_template()
+        if not template:
+            raise Exception("数据库中没有模板工作表，请先创建模板")
+        template_id = template["id"]
+        sheet_id = template["sheet_id"]
+    elif template_id is not None:
+        template = db.get_template(template_id)
+        if not template:
+            raise Exception(f"未找到模板记录：template_id={template_id}")
+        sheet_id = template["sheet_id"]
+    else:
+        template = db.get_template_by_sheet_id(sheet_id)
+        if not template:
+            raise Exception(f"未找到模板记录：sheet_id={sheet_id}")
+        template_id = template["id"]
+
+    doc_id = template.get("doc_id")
+    if not doc_id:
+        raise Exception("模板记录缺失 doc_id，无法同步模板内容")
+
+    with httpx.Client(timeout=30) as client:
+        token = api_wework.get_access_token(client, corp_id, secret)
+        remote_snapshot = _read_remote_template_snapshot(client, token, doc_id, sheet_id)
+
+    existing_snapshot = template.get("template_content") or {}
+    if existing_snapshot == remote_snapshot:
+        return {
+            "template_id": template_id,
+            "sheet_id": sheet_id,
+            "updated": False,
+            "before": existing_snapshot,
+            "after": remote_snapshot,
+        }
+
+    db.update_template_content(template_id, remote_snapshot)
+
+    if operator_userid:
+        user_id = db.insert_user(operator_userid, operator_name or operator_userid)
+        db.insert_log(
+            operator_id=user_id,
+            target_id=template_id,
+            operation_type="sync_template_content",
+            target_type="template",
+            detail={
+                "sheet_id": sheet_id,
+                "doc_id": doc_id,
+                "before": existing_snapshot,
+                "after": remote_snapshot,
+            },
+        )
+
+    return {
+        "template_id": template_id,
+        "sheet_id": sheet_id,
+        "updated": True,
+        "before": existing_snapshot,
+        "after": remote_snapshot,
+    }
 
 
 def _build_field_payload(field_def: Dict) -> Dict:

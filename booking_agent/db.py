@@ -137,6 +137,39 @@ def insert_template(doc_id, sheet_id, sheet_name, created_by, template_content=N
     conn.close()
     return row_id
 
+
+def update_template_content(template_id: int, template_content: dict) -> bool:
+    """更新模板快照内容，返回是否真的发生了变更"""
+    if template_id is None:
+        return False
+    conn = get_connection()
+    cursor = conn.cursor()
+    payload = json.dumps(template_content, ensure_ascii=False) if template_content else None
+    cursor.execute(
+        'UPDATE templates SET template_content = ? WHERE id = ?',
+        (payload, template_id)
+    )
+    changed = cursor.rowcount > 0
+    conn.commit()
+    conn.close()
+    return changed
+
+
+def get_template_by_sheet_id(sheet_id: str):
+    """按 sheet_id 获取模板记录（含 template_content 解析后的 dict）"""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute('SELECT * FROM templates WHERE sheet_id = ? LIMIT 1', (sheet_id,))
+    row = cursor.fetchone()
+    conn.close()
+    if row:
+        result = dict(row)
+        if result.get("template_content"):
+            result["template_content"] = json.loads(result["template_content"])
+        return result
+    return None
+
+
 def get_first_doc():
     """获取第一个智能表格记录（用于后续操作）"""
     conn = get_connection()
