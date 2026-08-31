@@ -450,8 +450,28 @@ def sync_template_content_from_remote(
         remote_snapshot = _read_remote_template_snapshot(client, token, doc_id, sheet_id)
 
     existing_snapshot = template.get("template_content") or {}
+    operator_id = None
+    if operator_userid:
+        operator_id = db.insert_user(operator_userid, operator_name or operator_userid)
+    else:
+        operator_id = db.insert_user("__system__", "system")
+
     if existing_snapshot == remote_snapshot:
         logging.info(f"[模板同步] 模板内容未变更，跳过写库：template_id={template_id}, sheet_id={sheet_id}")
+        db.insert_log(
+            operator_id=operator_id,
+            target_id=template_id,
+            operation_type="sync_template_content",
+            target_type="template",
+            detail={
+                "sheet_id": sheet_id,
+                "doc_id": doc_id,
+                "updated": False,
+                "before": existing_snapshot,
+                "after": remote_snapshot,
+                "source": "auto" if not operator_userid else "manual",
+            },
+        )
         return {
             "template_id": template_id,
             "sheet_id": sheet_id,
@@ -463,20 +483,20 @@ def sync_template_content_from_remote(
     db.update_template_content(template_id, remote_snapshot)
     logging.info(f"[模板同步] 模板内容已落库：template_id={template_id}, sheet_id={sheet_id}, updated=True")
 
-    if operator_userid:
-        user_id = db.insert_user(operator_userid, operator_name or operator_userid)
-        db.insert_log(
-            operator_id=user_id,
-            target_id=template_id,
-            operation_type="sync_template_content",
-            target_type="template",
-            detail={
-                "sheet_id": sheet_id,
-                "doc_id": doc_id,
-                "before": existing_snapshot,
-                "after": remote_snapshot,
-            },
-        )
+    db.insert_log(
+        operator_id=operator_id,
+        target_id=template_id,
+        operation_type="sync_template_content",
+        target_type="template",
+        detail={
+            "sheet_id": sheet_id,
+            "doc_id": doc_id,
+            "updated": True,
+            "before": existing_snapshot,
+            "after": remote_snapshot,
+            "source": "auto" if not operator_userid else "manual",
+        },
+    )
 
     return {
         "template_id": template_id,
