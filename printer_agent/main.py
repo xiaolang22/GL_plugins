@@ -1,4 +1,4 @@
-"""打印机控制服务 - 通过 TCP 9100 端口发送 ESC/POS 指令，对外暴露 HTTP /print 接口
+"""打印机控制服务 - 通过 TCP 9100 端口发送 ESC/POS 指令，对外暴露 HTTP /print、/print_batch 接口
 
 行内联样式格式: "<文本>|<样式1>,<样式2>,..."
     样式 token:
@@ -182,6 +182,87 @@ def print_api(req: PrintRequest) -> PrintResponse:
 
     return PrintResponse(success=True, message="ok",
                          line_count=line_count, char_count=char_count, byte_count=byte_count)
+
+
+# ---------- 批量打印 ----------
+
+class BatchSheet(BaseModel):
+    index: int          # 调用方指定的单据序号，结果中原样回传
+    lines: List[str]    # 该张单的打印内容，格式与 /print 的 lines 一致
+
+
+class BatchPrintRequest(BaseModel):
+    sheets: List[BatchSheet]
+
+
+class SheetPrintResult(BaseModel):
+    index: int
+    success: bool
+    message: str
+    line_count: int
+    char_count: int
+    byte_count: int
+
+
+class BatchPrintResponse(BaseModel):
+    success: bool        # 全部单成功才为 True
+    message: str
+    total: int
+    success_count: int
+    fail_count: int
+    results: List[SheetPrintResult]   # 顺序与输入 sheets 一致
+
+
+def print_batch_sheets(sheets: List[BatchSheet]) -> List[SheetPrintResult]:
+    """串行批量打印: 按输入顺序逐张打印，每张独立 TCP 连接。
+
+    - 每张单走完整 INIT → 逐行 → CUT 流程，物理上独立出纸/切纸；
+    - 单张失败（内容为空 / 连接超时 / 连接错误等）只记录该张失败结果，
+      不中断后续单据（best-effort）；
+    - 不并发：单台物理打印机，并发会导致 ESC/POS 指令交错。
+    """
+    results: List[SheetPrintResult] = []
+    for sheet in sheets:
+        if not sheet.lines:
+            results.append(SheetPrintResult(
+                index=sheet.index, success=False, message="lines is empty",
+                line_count=0, char_count=0, byte_count=0))
+            continue
+
+        # 统计基于解析后的纯文本
+        parsed = [_parse_line(raw) for raw in sheet.lines]
+        line_count = len(parsed)
+        char_count = sum(len(t) for t, _ in parsed)
+
+        try:
+            byte_count = print_lines(sheet.lines)
+        except (socket.timeout, ConnectionError, OSError) as e:
+            results.append(SheetPrintResult(
+                index=sheet.index, success=False, message=f"printer error: {e}",
+                line_count=line_count, char_count=char_count, byte_count=0))
+            continue
+
+        results.append(SheetPrintResult(
+            index=sheet.index, success=True, message="ok",
+            line_count=line_count, char_count=char_count, byte_count=byte_count))
+    return results
+
+
+@app.post("/print_batch", response_model=BatchPrintResponse)
+def print_batch_api(req: BatchPrintRequest) -> BatchPrintResponse:
+    if not req.sheets:
+        return BatchPrintResponse(
+            success=False, message="sheets is empty",
+            total=0, success_count=0, fail_count=0, results=[])
+
+    results = print_batch_sheets(req.sheets)
+    success_count = sum(1 for r in results if r.success)
+    fail_count = len(results) - success_count
+    return BatchPrintResponse(
+        success=(fail_count == 0),
+        message=f"total={len(results)}, success={success_count}, failed={fail_count}",
+        total=len(results), success_count=success_count,
+        fail_count=fail_count, results=results)
 
 
 if __name__ == "__main__":
