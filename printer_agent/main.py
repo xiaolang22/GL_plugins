@@ -213,38 +213,81 @@ class BatchPrintResponse(BaseModel):
     results: List[SheetPrintResult]   # 顺序与输入 sheets 一致
 
 
-def print_batch_sheets(sheets: List[BatchSheet]) -> List[SheetPrintResult]:
-    """串行批量打印: 按输入顺序逐张打印，每张独立 TCP 连接。
+def _send_sheet(sock: socket.socket, lines: List[str]) -> int:
+    """在已建立的连接上发送单张打印单（不含 INIT）：逐行打印 → 切纸。
 
-    - 每张单走完整 INIT → 逐行 → CUT 流程，物理上独立出纸/切纸；
-    - 单张失败（内容为空 / 连接超时 / 连接错误等）只记录该张失败结果，
-      不中断后续单据（best-effort）；
+    返回发送字节数。每行样式均显式设置并在换行后复位（见 RESET_STYLE），
+    因此单据之间不需要重发 INIT。
+    """
+    total_bytes = 0
+    for raw in lines:
+        text, style = _parse_line(raw)
+        cmd = _line_cmd(text, style)
+        sock.sendall(cmd)
+        total_bytes += len(cmd)
+    sock.sendall(CUT)
+    total_bytes += len(CUT)
+    return total_bytes
+
+
+def print_batch_sheets(sheets: List[BatchSheet]) -> List[SheetPrintResult]:
+    """串行批量打印：整批共用一条 TCP 连接，单据之间以 CUT 切纸分隔。
+
+    为什么不能每张单新建连接 + 重发 INIT（实测 3 张单只出 1 张纸）：
+    - 9101 端口的打印代理按"连接"投递打印任务，快速连续建连时新连接
+      会冲掉上一条连接尚未出纸的任务；
+    - INIT(ESC @) 会清空打印机打印缓冲，后一张单的 INIT 会清掉前一张
+      单缓冲中尚未打完的内容。
+    因此整批复用一条连接，仅在连接建立（及断线重连）时发一次 INIT。
+
+    - 严格串行，按输入顺序逐张发送，每张单末尾 CUT 独立切纸；
+    - 单张失败（内容为空 / 超时 / 断连等）只记录该张失败结果，不中断
+      后续单据（best-effort）；断连后下一张单自动重建连接；
     - 不并发：单台物理打印机，并发会导致 ESC/POS 指令交错。
     """
     results: List[SheetPrintResult] = []
-    for sheet in sheets:
-        if not sheet.lines:
+    sock = None  # type: socket.socket | None
+    try:
+        for sheet in sheets:
+            if not sheet.lines:
+                results.append(SheetPrintResult(
+                    index=sheet.index, success=False, message="lines is empty",
+                    line_count=0, char_count=0, byte_count=0))
+                continue
+
+            # 统计基于解析后的纯文本
+            parsed = [_parse_line(raw) for raw in sheet.lines]
+            line_count = len(parsed)
+            char_count = sum(len(t) for t, _ in parsed)
+
+            try:
+                if sock is None:
+                    sock = _connect()
+                    sock.sendall(INIT)  # 仅连接建立时初始化一次
+                    byte_count = len(INIT) + _send_sheet(sock, sheet.lines)
+                else:
+                    byte_count = _send_sheet(sock, sheet.lines)
+            except (socket.timeout, ConnectionError, OSError) as e:
+                # 连接已不可用：丢弃坏连接，下一张单重建连接后继续
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+                sock = None
+                results.append(SheetPrintResult(
+                    index=sheet.index, success=False, message=f"printer error: {e}",
+                    line_count=line_count, char_count=char_count, byte_count=0))
+                continue
+
             results.append(SheetPrintResult(
-                index=sheet.index, success=False, message="lines is empty",
-                line_count=0, char_count=0, byte_count=0))
-            continue
-
-        # 统计基于解析后的纯文本
-        parsed = [_parse_line(raw) for raw in sheet.lines]
-        line_count = len(parsed)
-        char_count = sum(len(t) for t, _ in parsed)
-
-        try:
-            byte_count = print_lines(sheet.lines)
-        except (socket.timeout, ConnectionError, OSError) as e:
-            results.append(SheetPrintResult(
-                index=sheet.index, success=False, message=f"printer error: {e}",
-                line_count=line_count, char_count=char_count, byte_count=0))
-            continue
-
-        results.append(SheetPrintResult(
-            index=sheet.index, success=True, message="ok",
-            line_count=line_count, char_count=char_count, byte_count=byte_count))
+                index=sheet.index, success=True, message="ok",
+                line_count=line_count, char_count=char_count, byte_count=byte_count))
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
     return results
 
 
