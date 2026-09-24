@@ -46,7 +46,7 @@ def get_virtual_now() -> datetime:
 
 # ==================== 智能表总限额 ====================
 MAX_SHEETS_LIMIT = 255
-BUFFER_DAYS_PAST = 7  # buffer 向前覆盖过去几天（不含今天）
+BUFFER_DAYS_PAST = 1  # buffer 向前覆盖过去几天（不含今天）
 
 # 座位数据（按顺序）
 SEAT_DATA = [
